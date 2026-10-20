@@ -135,24 +135,36 @@ def sanitize_error_message(message: str) -> str:
     return sanitized
 
 
-def sanitize_dict_for_manifest(data: dict[str, Any]) -> dict[str, Any]:
-    """Recursively redact sensitive credential keys in structured dictionaries.
+def sanitize_value(val: Any) -> Any:
+    """Recursively sanitize any JSON-native value (dict, list, string, primitive).
 
-    Replaces credential values with '[REDACTED]' rather than deleting the key,
-    ensuring transparency in reproducible manifests while protecting secrets.
+    Guarantees that credentials in dictionaries, nested lists, and URL strings are
+    redacted at arbitrary depth.
     """
-    clean: dict[str, Any] = {}
-    for k, v in data.items():
-        if is_sensitive_key(k):
-            clean[k] = REDACTED_STR
-        elif isinstance(v, dict):
-            clean[k] = sanitize_dict_for_manifest(v)
-        elif isinstance(v, list):
-            clean[k] = [
-                sanitize_dict_for_manifest(item) if isinstance(item, dict) else item for item in v
-            ]
-        elif isinstance(v, str) and ("://" in v):
-            clean[k] = sanitize_url(v)
-        else:
-            clean[k] = copy.deepcopy(v)
-    return clean
+    if isinstance(val, dict):
+        clean: dict[str, Any] = {}
+        for k, v in val.items():
+            if is_sensitive_key(str(k)):
+                clean[k] = REDACTED_STR
+            else:
+                clean[k] = sanitize_value(v)
+        return clean
+
+    if isinstance(val, list):
+        return [sanitize_value(item) for item in val]
+
+    if isinstance(val, str):
+        s = val
+        if "://" in s:
+            s = sanitize_url(s)
+        s = sanitize_error_message(s)
+        return s
+
+    return copy.deepcopy(val)
+
+
+def sanitize_dict_for_manifest(data: dict[str, Any]) -> dict[str, Any]:
+    """Recursively redact sensitive credential keys and nested URLs in structured dictionaries."""
+    sanitized = sanitize_value(data)
+    assert isinstance(sanitized, dict)
+    return sanitized

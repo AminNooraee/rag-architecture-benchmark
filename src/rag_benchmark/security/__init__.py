@@ -6,6 +6,7 @@ from rag_benchmark.security.sanitizer import (
     sanitize_dict_for_manifest,
     sanitize_error_message,
     sanitize_url,
+    sanitize_value,
 )
 
 __all__ = [
@@ -14,4 +15,5 @@ __all__ = [
     "sanitize_dict_for_manifest",
     "sanitize_error_message",
     "sanitize_url",
+    "sanitize_value",
 ]

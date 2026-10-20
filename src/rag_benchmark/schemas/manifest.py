@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import platform
 import sys
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Self
@@ -26,7 +27,7 @@ class RunStatus(StrEnum):
 class RuntimeMetadata(BaseModel):
     """Environment and platform details for benchmark reproducibility."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid", validate_assignment=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     python_version: str = Field(default_factory=lambda: sys.version.split()[0])
     os_name: str = Field(default_factory=platform.system)
@@ -44,7 +45,7 @@ class RuntimeMetadata(BaseModel):
 class RunManifest(BaseModel):
     """Reproducible record of a benchmark run execution."""
 
-    model_config = ConfigDict(extra="forbid", validate_assignment=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     run_id: str = Field(
         ...,
@@ -144,8 +145,24 @@ class RunManifest(BaseModel):
         return sanitize_dict_for_manifest(strict)
 
     @model_validator(mode="after")
-    def validate_lifecycle_invariants(self) -> Self:
-        """Enforce strict lifecycle and counter invariants across fields."""
+    def validate_lifecycle_and_identity_invariants(self) -> Self:
+        """Enforce strict lifecycle, counter invariants, and identity consistency."""
+        # V-06: Schema-level manifest/config identity verification
+        if self.benchmark_config:
+            cfg_system = self.benchmark_config.get("system")
+            if cfg_system and cfg_system != self.system:
+                raise ValueError(
+                    f"Manifest system '{self.system}' contradicts "
+                    f"benchmark_config.system '{cfg_system}'"
+                )
+            cfg_variant = self.benchmark_config.get("variant")
+            if cfg_variant and cfg_variant != self.variant:
+                raise ValueError(
+                    f"Manifest variant '{self.variant}' contradicts "
+                    f"benchmark_config.variant '{cfg_variant}'"
+                )
+
+        # Lifecycle state rules
         if self.status == RunStatus.RUNNING:
             if self.finished_at is not None:
                 raise ValueError("finished_at must be None while manifest status is RUNNING")
@@ -165,6 +182,14 @@ class RunManifest(BaseModel):
                     f"success ({self.successful_queries}) + failed ({self.failed_queries})"
                 )
         return self
+
+    def model_copy(self, *, update: Mapping[str, Any] | None = None, deep: bool = False) -> Self:
+        """Safely copy the manifest, ensuring that any updates run through full model validation."""
+        if update:
+            data = self.model_dump()
+            data.update(dict(update))
+            return self.model_validate(data)
+        return super().model_copy(deep=deep)
 
     def finalize(
         self,

@@ -174,8 +174,12 @@ def create_manifest(
 
 
 def save_manifest(manifest: RunManifest, path: Path) -> None:
-    """Persist manifest to JSON using atomic replacement and fsync."""
-    manifest_dict = manifest.model_dump(mode="json")
+    """Persist manifest to JSON using atomic replacement and fsync.
+
+    Revalidates the complete manifest object before writing.
+    """
+    revalidated = RunManifest.model_validate(manifest.model_dump())
+    manifest_dict = revalidated.model_dump(mode="json")
     atomic_write_json(path, manifest_dict)
 
 
