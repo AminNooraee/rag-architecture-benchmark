@@ -123,6 +123,11 @@ class RunPaths:
         """Path to exclusive writer lock file: writer.lock."""
         return self.run_dir / "writer.lock"
 
+    @property
+    def guard_path(self) -> Path:
+        """Path to exclusive acquisition guard file: writer.lock.guard."""
+        return self.run_dir / "writer.lock.guard"
+
     def ensure_directories(self) -> None:
         """Ensure that the run directory exists."""
         self.run_dir.mkdir(parents=True, exist_ok=True)

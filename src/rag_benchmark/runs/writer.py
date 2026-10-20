@@ -6,7 +6,10 @@ import ctypes
 import json
 import os
 import platform
+import time
 import uuid
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -43,6 +46,65 @@ class WriterLifecycle(StrEnum):
     ACTIVE = "active"
     FINALIZED = "finalized"
     CLOSED = "closed"
+
+
+@contextmanager
+def _guard_lock(guard_path: Path, timeout: float = 3.0) -> Iterator[None]:
+    """Acquire an exclusive OS file lock on guard_path to serialize acquisition/recovery."""
+    guard_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(str(guard_path), os.O_CREAT | os.O_RDWR)
+    f = os.fdopen(fd, "r+", encoding="utf-8")
+    f.seek(0, os.SEEK_END)
+    if f.tell() == 0:
+        f.write("0")
+        f.flush()
+    f.seek(0)
+
+    start = time.monotonic()
+    locked = False
+    is_windows = platform.system() == "Windows"
+
+    while True:
+        try:
+            if is_windows:
+                import msvcrt
+
+                f.seek(0)
+                msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(  # type: ignore[attr-defined]
+                    f.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,  # type: ignore[attr-defined]
+                )
+            locked = True
+            break
+        except (OSError, BlockingIOError) as e:
+            if time.monotonic() - start > timeout:
+                f.close()
+                raise WriterConcurrencyError(
+                    f"Acquisition guard '{guard_path.name}' timed out after {timeout}s."
+                ) from e
+            time.sleep(0.01)
+
+    try:
+        yield
+    finally:
+        if locked:
+            try:
+                if is_windows:
+                    import msvcrt
+
+                    f.seek(0)
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]
+            except OSError:
+                pass
+        f.close()
 
 
 def _is_pid_alive(pid: int) -> bool:
@@ -146,11 +208,12 @@ class RunArtifactWriter:
     def _acquire_lock(self) -> None:
         """Acquire exclusive writer ownership of the run directory.
 
-        Employs atomic file creation and race-safe atomic claim file replacement
-        for stale locks, preventing concurrent takeover collisions.
+        Serializes lock acquisition and stale-lock reclamation via an exclusive OS
+        file lock on writer.lock.guard before inspecting or mutating writer.lock.
         """
         self.paths.ensure_directories()
         lock_path = self.paths.lock_path
+        guard_path = self.paths.guard_path
 
         lock_data = {
             "owner_token": self._owner_token,
@@ -160,89 +223,73 @@ class RunArtifactWriter:
             "run_id": self.run_id,
         }
 
-        # 1. Attempt atomic creation
-        try:
-            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(strict_json_dumps(lock_data))
-                f.flush()
-            self._owns_lock = True
-            return
-        except FileExistsError:
-            pass
-
-        # 2. File exists. Inspect holder process on this host
-        is_stale = False
-        existing_pid: int | None = None
-        existing_token: str | None = None
-        try:
-            with open(lock_path, encoding="utf-8") as f:
-                info = json.load(f)
-                existing_pid = info.get("pid")
-                existing_host = info.get("host")
-                existing_token = info.get("owner_token")
-                if existing_host == platform.node() and existing_pid:
-                    if not _is_pid_alive(existing_pid):
-                        is_stale = True
-        except Exception:
-            # File may be mid-creation or unreadable, treat as active to avoid corruption
-            pass
-
-        # 3. If process is dead, perform atomic claim takeover
-        if is_stale and existing_pid is not None:
-            claim_id = uuid.uuid4().hex
-            claim_path = lock_path.with_name(f"{lock_path.name}.claim.{claim_id}")
-            try:
-                # Atomic rename: moves lock_path to claim_path.
-                # Only ONE process can succeed; contenders receive FileNotFoundError/OSError.
-                os.replace(str(lock_path), str(claim_path))
-            except (FileNotFoundError, OSError) as e:
-                raise WriterConcurrencyError(
-                    f"Failed to claim stale lock for run '{self.run_id}': "
-                    "lock claimed by another process."
-                ) from e
-
-            # Verify the claimed lock was indeed the inspected stale lock
-            try:
-                with open(claim_path, encoding="utf-8") as f:
-                    claim_info = json.load(f)
-                if (
-                    claim_info.get("pid") != existing_pid
-                    or claim_info.get("owner_token") != existing_token
-                ):
+        with _guard_lock(guard_path):
+            # 1. If writer.lock does not exist, create it atomically
+            if not lock_path.exists():
+                try:
+                    fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        f.write(strict_json_dumps(lock_data))
+                        f.flush()
+                    self._owns_lock = True
+                    return
+                except FileExistsError as e:
                     raise WriterConcurrencyError(
-                        f"Stale lock for run '{self.run_id}' changed before claim takeover."
-                    )
-            except Exception as e:
-                if isinstance(e, WriterConcurrencyError):
-                    raise
-                raise WriterConcurrencyError(
-                    f"Failed to verify claimed lock for run '{self.run_id}': {e}"
-                ) from e
-            finally:
-                if claim_path.exists():
-                    try:
-                        claim_path.unlink()
-                    except OSError:
-                        pass
+                        f"Lock collision during creation for run '{self.run_id}': {e}"
+                    ) from e
 
-            # Atomically establish the new lock with our owner token
+            # 2. writer.lock exists: inspect owner info
+            is_stale = False
+            existing_pid: int | None = None
+            existing_token: str | None = None
+            existing_host: str | None = None
             try:
-                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write(strict_json_dumps(lock_data))
-                    f.flush()
-                self._owns_lock = True
-                return
-            except Exception as e:
-                raise WriterConcurrencyError(
-                    f"Failed to establish new lock for run '{self.run_id}' after claim: {e}"
-                ) from e
+                with open(lock_path, encoding="utf-8") as f:
+                    info = json.load(f)
+                    existing_pid = info.get("pid")
+                    existing_host = info.get("host")
+                    existing_token = info.get("owner_token")
+                    if existing_host == platform.node() and existing_pid:
+                        if not _is_pid_alive(existing_pid):
+                            is_stale = True
+            except Exception:
+                # File may be mid-creation or unreadable; treat as active
+                pass
 
-        raise WriterConcurrencyError(
-            f"Run '{self.run_id}' is owned by active writer (PID {existing_pid}). "
-            "Parallel query workers must route results through the single owning writer."
-        )
+            # 3. If stale, re-verify and reclaim while holding the guard
+            if is_stale and existing_pid is not None and existing_token is not None:
+                # Re-verify lock file still matches inspected token
+                try:
+                    with open(lock_path, encoding="utf-8") as f:
+                        verify_info = json.load(f)
+                    if verify_info.get("owner_token") != existing_token:
+                        raise WriterConcurrencyError(
+                            f"Stale lock for run '{self.run_id}' changed before removal."
+                        )
+                    lock_path.unlink()
+                except OSError as e:
+                    raise WriterConcurrencyError(
+                        f"Failed to remove stale lock for run '{self.run_id}': {e}"
+                    ) from e
+
+                # Create new writer.lock using O_CREAT | O_EXCL
+                try:
+                    fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
+                    with os.fdopen(fd, "w", encoding="utf-8") as f:
+                        f.write(strict_json_dumps(lock_data))
+                        f.flush()
+                    self._owns_lock = True
+                    return
+                except Exception as e:
+                    raise WriterConcurrencyError(
+                        f"Failed to establish new lock for run '{self.run_id}': {e}"
+                    ) from e
+
+            # 4. Otherwise, holder is active (or on remote host)
+            raise WriterConcurrencyError(
+                f"Run '{self.run_id}' is owned by active writer (PID {existing_pid}). "
+                "Parallel query workers must route results through the single owning writer."
+            )
 
     def _verify_lock_held(self) -> bool:
         """Verify that this writer instance still owns the lock file on disk."""
