@@ -8,12 +8,9 @@ import pytest
 from pydantic import ValidationError
 
 from rag_benchmark.config.loader import load_config
-from rag_benchmark.config.models import (
-    BenchmarkConfig,
-    LLMConfig,
-    sanitize_dict_for_manifest,
-)
+from rag_benchmark.config.models import BenchmarkConfig, LLMConfig
 from rag_benchmark.errors.models import ConfigurationError
+from rag_benchmark.security.sanitizer import REDACTED_STR, sanitize_dict_for_manifest
 
 
 def test_default_config_creation() -> None:
@@ -70,15 +67,15 @@ def test_load_config_missing_file_raises_error(tmp_path: Path) -> None:
 
 def test_secret_leakage_prevention_in_extra() -> None:
     """Attempting to embed secrets in config extra fields must raise validation error."""
-    with pytest.raises(ValidationError, match="sensitive information"):
+    with pytest.raises(ValidationError, match="sensitive credential information"):
         BenchmarkConfig(extra={"openai_api_key": "sk-secret12345"})
 
-    with pytest.raises(ValidationError, match="sensitive information"):
+    with pytest.raises(ValidationError, match="sensitive credential information"):
         BenchmarkConfig(extra={"auth_token": "bearer xyz"})
 
 
-def test_sanitize_dict_for_manifest_strips_secrets() -> None:
-    """Sanitizer must recursively remove any keys matching credential patterns."""
+def test_sanitize_dict_for_manifest_redacts_secrets() -> None:
+    """Sanitizer replaces credential keys with [REDACTED] rather than silently deleting."""
     raw_dict = {
         "system": "traditional_rag",
         "nested": {
@@ -98,12 +95,12 @@ def test_sanitize_dict_for_manifest_strips_secrets() -> None:
 
     sanitized = sanitize_dict_for_manifest(raw_dict)
 
-    assert "api_key" not in sanitized["nested"]
-    assert "password" not in sanitized["nested"]
+    assert sanitized["nested"]["api_key"] == REDACTED_STR
+    assert sanitized["nested"]["password"] == REDACTED_STR
     assert sanitized["nested"]["safe_param"] == 42
-    assert "user_token" not in sanitized["nested"]["deep"]
+    assert sanitized["nested"]["deep"]["user_token"] == REDACTED_STR
     assert sanitized["nested"]["deep"]["valid_field"] == "clean_value"
-    assert "secret_val" not in sanitized["list_items"][0]
+    assert sanitized["list_items"][0]["secret_val"] == REDACTED_STR
     assert sanitized["list_items"][0]["allowed"] == "yes"
 
 
@@ -117,7 +114,3 @@ def test_to_safe_dict_produces_clean_manifest_dict() -> None:
     safe = config.to_safe_dict()
     assert safe["system"] == "neo4j_graphrag"
     assert safe["llm"]["model"] == "local-persian-model"
-    # Ensure no secret keys exist in the safe dict
-    for k in safe:
-        assert "key" not in k.lower()
-        assert "secret" not in k.lower()

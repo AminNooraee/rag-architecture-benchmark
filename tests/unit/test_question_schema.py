@@ -7,6 +7,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
+from rag_benchmark.errors.models import GroundTruthLeakageError
 from rag_benchmark.schemas.evidence import EvidenceType, RetrievedEvidence
 from rag_benchmark.schemas.question import (
     AdapterQueryInput,
@@ -38,6 +39,7 @@ def test_valid_persian_question_creation() -> None:
         supporting_evidence=[evidence],
         answerable=True,
         dataset_source="persian_bench_v1",
+        query_metadata={"domain": "geography"},
         metadata={"annotator": "کاربر ۱"},
     )
 
@@ -47,6 +49,7 @@ def test_valid_persian_question_creation() -> None:
     assert q.reasoning_hops == 1
     assert q.gold_answer == "تهران"
     assert len(q.supporting_evidence) == 1
+    assert q.query_metadata["domain"] == "geography"
 
 
 def test_all_question_types_supported() -> None:
@@ -128,7 +131,7 @@ def test_reject_empty_question_and_id() -> None:
 def test_to_query_input_enforces_ground_truth_isolation() -> None:
     """CRITICAL: RAG adapter query() must NEVER receive gold answers or ground truth evidence.
 
-    to_query_input() must strip gold_answer, acceptable_answers, and supporting evidence.
+    to_query_input() forwards query_metadata, strictly withholding evaluation metadata.
     """
     evidence = RetrievedEvidence(
         document_id="doc-99",
@@ -144,7 +147,8 @@ def test_to_query_input_enforces_ground_truth_isolation() -> None:
         acceptable_answers=["1313", "۱۳۱۳"],
         supporting_document_ids=["doc-99"],
         supporting_evidence=[evidence],
-        metadata={"category": "history", "eval_secret": "do_not_leak"},
+        query_metadata={"category": "history"},
+        metadata={"eval_secret": "do_not_leak"},
     )
 
     query_input = question.to_query_input()
@@ -155,11 +159,25 @@ def test_to_query_input_enforces_ground_truth_isolation() -> None:
     assert query_input.metadata.get("category") == "history"
     assert "eval_secret" not in query_input.metadata
 
-    # AdapterQueryInput does not even possess ground-truth fields
+    # AdapterQueryInput does not possess ground-truth fields
     assert not hasattr(query_input, "gold_answer")
     assert not hasattr(query_input, "acceptable_answers")
     assert not hasattr(query_input, "supporting_document_ids")
     assert not hasattr(query_input, "supporting_evidence")
+
+
+def test_query_metadata_rejects_ground_truth_leakage() -> None:
+    """Attempting to embed ground truth keys into query_metadata raises GroundTruthLeakageError."""
+    question = BenchmarkQuestion(
+        question_id="q-leak",
+        question="یک سؤال؟",
+        question_type=QuestionType.DIRECT_FACTUAL,
+        scope=QuestionScope.LOCAL,
+        gold_answer="پاسخ",
+        query_metadata={"gold_answer": "leaked_answer"},
+    )
+    with pytest.raises(GroundTruthLeakageError, match="Forbidden ground-truth key"):
+        question.to_query_input()
 
 
 def test_question_unicode_roundtrip() -> None:

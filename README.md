@@ -1,6 +1,6 @@
 # Persian RAG Architecture Benchmark
 
-> **Phase 3A — Benchmark Harness Foundation**
+> **Phase 3A — Benchmark Harness Foundation (Remediated)**
 
 A rigorous, production-oriented evaluation harness for comparing Retrieval-Augmented Generation (RAG) architectures on Persian-language corpora.
 
@@ -25,9 +25,17 @@ Later phases will benchmark the following architectures against this harness:
 
 ---
 
-## 2. Canonical Schemas
+## 2. Canonical Schemas & Strict Data Contracts
 
-All systems exchange data through strictly validated, serializable Pydantic v2 data models.
+All benchmark components exchange data through strictly validated Pydantic v2 models adhering to a shared strict JSON contract.
+
+### Strict JSON Contract
+All metadata, configuration extras, and diagnostics are recursively limited to JSON-native primitives:
+- `null`, `boolean`, `integer`, `finite float` (no `NaN`, `Infinity`, or `-Infinity`), `string`
+- `list` of valid JSON values (Python `tuple` and `set` are strictly rejected)
+- `dict` with **string keys only** and valid JSON values
+- Datetimes, custom classes, and uncoerced enums are rejected.
+- Models perform defensive deep copies during validation to guarantee that external post-construction dictionary mutations cannot silently alter validated benchmark states.
 
 ### Document Schema (`BenchmarkDocument`, `DocumentSection`)
 Represents source knowledge assets with structural subsections and metadata:
@@ -37,33 +45,27 @@ Represents source knowledge assets with structural subsections and metadata:
 
 ### Question Schema (`BenchmarkQuestion`, `AdapterQueryInput`)
 Represents evaluation queries covering 8 standardized question types:
-- `direct_factual`
-- `detailed_factual`
-- `multi_hop`
-- `relationship`
-- `cross_document`
-- `global_summary`
-- `hierarchical`
-- `unanswerable`
-
-Scopes include `local`, `multi_document`, and `global`.
+- `direct_factual`, `detailed_factual`, `multi_hop` (enforces `reasoning_hops >= 2`), `relationship`, `cross_document`, `global_summary`, `hierarchical`, `unanswerable` (enforces `answerable=False` and empty `gold_answer`).
 
 #### Ground-Truth Isolation & Architectural Fairness
 > **CRITICAL ARCHITECTURAL CONTRACT**:
 > The adapter's normal `query()` invocation must **NEVER** receive gold answers, acceptable answers, or ground-truth supporting evidence.
 >
-> `BenchmarkQuestion.to_query_input()` generates an `AdapterQueryInput` that contains only the question text, identifier, and safe query-time metadata. Ground-truth reference information exists exclusively for downstream evaluation layers.
+> `BenchmarkQuestion.to_query_input()` generates an `AdapterQueryInput` that contains only the question text, identifier, and safe query-time metadata allowlisted in `query_metadata`. Evaluation-only metadata (`metadata`), gold answers, and reference evidence are strictly withheld. If forbidden ground-truth keys are detected in `query_metadata`, `GroundTruthLeakageError` is raised.
 
 ### Retrieved Evidence Schema (`RetrievedEvidence`)
 Represents evidence units independent of underlying RAG topology:
 - Supports `chunk`, `document`, `entity`, `relationship`, `community_report`, `summary_node`, `tree_node`, and `cypher_result`.
-- Preserves provenance back to the source document (`document_id`, `chunk_id`).
-- Strict JSON guarantees (forbidding `NaN`, `Infinity`, and `-Infinity`).
+- Preserves provenance back to source documents (`document_id`, `chunk_id`).
+- Strict finite scores and 1-based ranks.
 
 ### Query Result Schema (`QueryResult`)
 Canonical execution outcome:
-- Captures status (`success`, `failed`, `timeout`, `error`), answer text in Persian Unicode, retrieved evidence, `QueryUsage` (token and API call counts), and `QueryTiming` (retrieval, generation, and total latency in milliseconds).
-- **Failed queries**: A failed query produces a valid `QueryResult` containing structured diagnostics (`StructuredError`). Queries are never silently discarded.
+- Cross-field state matrix:
+  - **SUCCESS**: requires `status=SUCCESS`, `error=None`, and `answer=string`.
+  - **FAILED / ERROR / TIMEOUT**: requires `status!=SUCCESS`, `error=StructuredError`, and `answer=None`.
+  - Nested `StructuredError` must match the parent result's `question_id`, `system`, and `variant`.
+- **Failure Evidence Preservation**: If retrieval succeeds but generation fails, `create_failure()` retains all retrieved evidence items, retrieval latency, and stage usage metrics.
 
 ---
 
@@ -104,45 +106,63 @@ class BaseRAGAdapter(ABC):
 ### Fairness Rules
 > **The adapter normalizes execution and output; it must not add architecture-specific improvements that alter benchmark fairness unless declared as a benchmark variant.**
 
-Specifically, an adapter must **NOT** secretly inject:
-- Reranking
-- HyDE (Hypothetical Document Embeddings)
-- Query rewriting
-- Multi-query expansion
-- Hidden additional retrieval stages
+An adapter must **NOT** secretly inject reranking, HyDE, query rewriting, multi-query expansion, or hidden retrieval stages unless explicitly declared in a benchmark variant.
 
-unless an explicit benchmark variant is declared to evaluate that capability.
-
-### Capabilities and Optional Operations
-Adapters report supported capabilities via `AdapterCapabilities`:
-- `supports_incremental_insert`
-- `supports_update`
-- `supports_delete`
-- `supports_persistence`
-- `supports_async`
-- `supports_streaming`
-- `supports_native_citations`
-
-Optional lifecycle operations (`insert()`, `update()`, `delete()`) raise `UnsupportedOperationError` when called on systems that do not support them.
+### Capability Trustworthiness
+Adapters declare supported features via `AdapterCapabilities` (`supports_incremental_insert`, `supports_update`, `supports_delete`, `supports_persistence`, `supports_streaming`, `supports_native_citations`).
+- **Trustworthiness Check**: Calling `validate_capabilities()` fails early with `InvalidCapabilityDeclarationError` if an adapter advertises a capability without overriding the corresponding base method.
+- *Note*: Asynchronous execution (`supports_async`) is deferred until Phase 4 when an explicit async query contract is scheduled.
 
 ---
 
-## 4. Run Artifact Layout
+## 4. Run Artifact Layout & Single-Writer Model
 
-Each benchmark execution outputs artifacts into a deterministic, isolated run directory:
+Each benchmark execution outputs artifacts into an isolated, safe run directory:
 
 ```text
 runs/<run_id>/
-  manifest.json        # Reproducible run metadata, git SHA, and sanitized config
+  writer.lock          # Exclusive process lock (single-writer enforcement)
+  manifest.json        # Atomic JSON manifest (UTC timestamps, sanitized config, git SHA)
   raw_results.jsonl    # Line-delimited JSON results (Persian UTF-8 unescaped)
   errors.jsonl         # Line-delimited JSON structured errors for diagnostics
 ```
 
-*(Future evaluation phases will add `metrics.json`, `retrieval_metrics.json`, `generation_metrics.json`, `efficiency.json`, and `production_score.json`. Phase 3A does NOT emit fake metrics.)*
+*(Future evaluation phases will add `metrics.json`, `retrieval_metrics.json`, etc. Phase 3A does not emit fake metrics.)*
 
-### Overwrite Protection & Secret Safety
-- **Collision Protection**: If `runs/<run_id>/` contains a completed run manifest, `RunArtifactWriter` raises `ArtifactCollisionError` unless `allow_overwrite=True` is explicitly supplied.
-- **Secret Sanitization**: All credentials (API keys, passwords, bearer tokens) are strictly excluded from configuration serializations and manifests via recursive scrubbing.
+### Single-Writer Concurrency Policy
+> **`RunArtifactWriter` is a single-writer durable artifact sink. Parallel query workers must send completed results to the owning writer rather than opening independent writers for the same run.**
+
+Exclusive process ownership is enforced via `writer.lock`. If another process attempts to open or initialize the run concurrently, `WriterConcurrencyError` is raised. Stale locks from crashed processes on the same host are safely detected and recovered upon resume.
+
+### Safe `run_id` Validation
+To prevent directory traversal and filesystem corruption, `run_id` must be a safe, single-component identifier:
+- Rejects `.`, `..`, path traversal components (`../`), absolute paths, drive letters (`C:`), colons, slashes (`/`, `\`), and Windows reserved device names (`CON`, `NUL`, etc.).
+- Verifies that the resolved run directory remains strictly enclosed within the resolved base directory.
+
+### Explicit Lifecycle Modes
+`RunArtifactWriter` enforces three unambiguous modes:
+1. **CREATE**: Fails with `ArtifactCollisionError` if `manifest.json`, `raw_results.jsonl`, or `errors.jsonl` already exists.
+2. **RESUME**: Resumes an actively `RUNNING` run. Reconstructs query counts and recorded question IDs from durable JSONL records. Rejects terminal runs (`COMPLETED` or `FAILED`).
+3. **OVERWRITE**: Atomically clears previous results, errors, and manifest before initializing clean state.
+
+### Result Uniqueness & Identity Binding
+Within a single run, each question may have only one canonical final result: `(run_id, question_id)`. Appending duplicate question IDs is rejected. Appended results and errors must match the writer's bound `system` and `variant`.
+
+### Atomic Manifest Writes
+Manifest writing uses atomic same-directory replacement:
+1. Serializes to strict JSON string without touching the destination.
+2. Writes to a temporary file in the target directory.
+3. Flushes and executes `os.fsync()`.
+4. Atomically replaces the destination using `os.replace()`.
+If an write error occurs, the pre-existing valid manifest remains completely intact.
+
+### Centralized Secret Redaction
+A centralized sanitization layer (`rag_benchmark.security.sanitizer`) protects credentials:
+- Exact and compound pattern matching for credentials (`api_key`, `token`, `password`, `secret`, `client_secret`, `private_key`).
+- Redacts sensitive values to `"[REDACTED]"` for manifest transparency.
+- Sanitizes embedded URL credentials (userinfo and sensitive query params).
+- Prevents false positives by explicitly protecting legitimate provenance keys (`author`, `authors`, `tokenizer`, `tokenizer_name`, `authorization_mode`, `token_count`, `input_tokens`, `output_tokens`).
+- *Limitation*: Sanitization is designed for structured fields, URLs, and standard token prefixes; it is not an arbitrary free-text NLP classifier.
 
 ---
 

@@ -198,14 +198,13 @@ def test_full_benchmark_harness_integration_flow(tmp_path: Path) -> None:
     assert idx_res.indexed_documents == 2
 
     # 5. Initialize Artifact Writer
-    writer = RunArtifactWriter(base_dir=runs_dir, run_id=run_id)
     manifest = create_manifest(
         run_id=run_id,
         system=adapter.system_name,
         variant=adapter.variant_name,
         config=config,
     )
-    writer.initialize(manifest)
+    writer = RunArtifactWriter.create(base_dir=runs_dir, manifest=manifest)
 
     # 6. Query Adapter with AdapterQueryInput ONLY (Fairness Isolation)
     for q in questions:

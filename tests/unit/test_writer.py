@@ -22,40 +22,31 @@ from rag_benchmark.schemas.result import (
 
 def test_run_directory_creation_and_manifest_write(tmp_path: Path) -> None:
     """Artifact writer creates directory and writes manifest."""
-    writer = RunArtifactWriter(base_dir=tmp_path, run_id="run-init-01")
     manifest = create_manifest(run_id="run-init-01", system="traditional_rag")
-
-    writer.initialize(manifest)
-
-    assert writer.paths.run_dir.exists()
-    assert writer.paths.manifest_path.exists()
+    with RunArtifactWriter.create(base_dir=tmp_path, manifest=manifest) as writer:
+        assert writer.paths.run_dir.exists()
+        assert writer.paths.manifest_path.exists()
 
 
 def test_overwrite_protection_prevents_accidental_clobbering(tmp_path: Path) -> None:
     """Attempting to re-initialize an existing finalized run raises ArtifactCollisionError."""
-    writer = RunArtifactWriter(base_dir=tmp_path, run_id="run-clobber-test", allow_overwrite=False)
     manifest = create_manifest(run_id="run-clobber-test", system="traditional_rag")
-    writer.initialize(manifest)
+    writer = RunArtifactWriter.create(base_dir=tmp_path, manifest=manifest)
     writer.finalize(status=RunStatus.COMPLETED)
 
-    # Attempting to re-initialize without allow_overwrite
-    writer2 = RunArtifactWriter(base_dir=tmp_path, run_id="run-clobber-test", allow_overwrite=False)
-    with pytest.raises(ArtifactCollisionError, match="already exists"):
-        writer2.initialize(manifest)
+    # Attempting to re-create when artifacts exist raises ArtifactCollisionError
+    with pytest.raises(ArtifactCollisionError, match="artifacts exist"):
+        RunArtifactWriter.create(base_dir=tmp_path, manifest=manifest)
 
-    # With allow_overwrite=True, it succeeds
-    writer_allowed = RunArtifactWriter(
-        base_dir=tmp_path, run_id="run-clobber-test", allow_overwrite=True
-    )
-    writer_allowed.initialize(manifest)
-    assert writer_allowed.paths.manifest_path.exists()
+    # With OVERWRITE mode, it succeeds
+    with RunArtifactWriter.overwrite(base_dir=tmp_path, manifest=manifest) as writer_allowed:
+        assert writer_allowed.paths.manifest_path.exists()
 
 
 def test_jsonl_append_and_persian_unicode(tmp_path: Path) -> None:
     """Verify appending results to raw_results.jsonl and errors.jsonl with Persian Unicode."""
-    writer = RunArtifactWriter(base_dir=tmp_path, run_id="run-results-test")
     manifest = create_manifest(run_id="run-results-test", system="traditional_rag")
-    writer.initialize(manifest)
+    writer = RunArtifactWriter.create(base_dir=tmp_path, manifest=manifest)
 
     evidence1 = RetrievedEvidence(
         document_id="doc-1",
@@ -114,9 +105,8 @@ def test_jsonl_append_and_persian_unicode(tmp_path: Path) -> None:
 
 def test_read_results_and_errors(tmp_path: Path) -> None:
     """Verify reading back query results and errors."""
-    writer = RunArtifactWriter(base_dir=tmp_path, run_id="run-read-test")
     manifest = create_manifest(run_id="run-read-test", system="test_sys")
-    writer.initialize(manifest)
+    writer = RunArtifactWriter.create(base_dir=tmp_path, manifest=manifest)
 
     res1 = QueryResult.create_success(
         question_id="q-read-1",
@@ -144,3 +134,5 @@ def test_read_results_and_errors(tmp_path: Path) -> None:
     assert len(errors) == 1
     assert errors[0].question_id == "q-read-2"
     assert errors[0].error_type == BenchmarkErrorType.RETRIEVAL_ERROR
+
+    writer.finalize(status=RunStatus.COMPLETED)

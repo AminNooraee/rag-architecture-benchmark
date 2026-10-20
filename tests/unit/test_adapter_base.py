@@ -13,7 +13,10 @@ from rag_benchmark.adapters.base import (
     IndexingResult,
 )
 from rag_benchmark.config.models import BenchmarkConfig
-from rag_benchmark.errors.models import UnsupportedOperationError
+from rag_benchmark.errors.models import (
+    InvalidCapabilityDeclarationError,
+    UnsupportedOperationError,
+)
 from rag_benchmark.schemas.document import BenchmarkDocument
 from rag_benchmark.schemas.evidence import EvidenceType, RetrievedEvidence
 from rag_benchmark.schemas.question import AdapterQueryInput
@@ -48,6 +51,7 @@ class ConcreteTestAdapter(BaseRAGAdapter):
         return self._capabilities
 
     def prepare(self, config: BenchmarkConfig) -> None:
+        self.validate_capabilities()
         self.prepared = True
 
     def index(self, documents: Sequence[BenchmarkDocument]) -> IndexingResult:
@@ -83,6 +87,19 @@ class ConcreteTestAdapter(BaseRAGAdapter):
         self.cleaned_up = True
 
 
+class FullyImplementedAdapter(ConcreteTestAdapter):
+    """Adapter that overrides optional methods when capabilities are True."""
+
+    def insert(self, documents: Sequence[BenchmarkDocument]) -> IndexingResult:
+        return IndexingResult(indexed_documents=len(documents), elapsed_ms=10.0)
+
+    def update(self, documents: Sequence[BenchmarkDocument]) -> IndexingResult:
+        return IndexingResult(indexed_documents=len(documents), elapsed_ms=10.0)
+
+    def delete(self, document_ids: Sequence[str]) -> None:
+        pass
+
+
 def test_concrete_adapter_lifecycle() -> None:
     """Verify full lifecycle of concrete adapter implementation."""
     adapter = ConcreteTestAdapter()
@@ -90,17 +107,14 @@ def test_concrete_adapter_lifecycle() -> None:
     assert adapter.system_name == "mock_rag"
     assert adapter.variant_name == "test_variant"
 
-    # Health check
     health = adapter.health()
     assert health.healthy is True
     assert health.system == "mock_rag"
 
-    # Prepare
     config = BenchmarkConfig(system="mock_rag")
     adapter.prepare(config)
     assert adapter.prepared is True
 
-    # Index
     doc = BenchmarkDocument(
         document_id="doc-test-1",
         title="عنوان تستی",
@@ -110,7 +124,6 @@ def test_concrete_adapter_lifecycle() -> None:
     assert idx_res.indexed_documents == 1
     assert idx_res.indexed_chunks == 2
 
-    # Query with AdapterQueryInput
     query_in = AdapterQueryInput(
         question_id="q-1",
         question="سؤال آزمایشی فارسی؟",
@@ -119,7 +132,6 @@ def test_concrete_adapter_lifecycle() -> None:
     assert res.status == QueryStatus.SUCCESS
     assert res.answer == "پاسخ آزمایشی برای: سؤال آزمایشی فارسی؟"
 
-    # Cleanup
     adapter.cleanup()
     assert adapter.cleaned_up is True
 
@@ -146,23 +158,32 @@ def test_optional_operations_raise_unsupported_by_default() -> None:
         adapter.delete(["d1"])
 
 
-def test_optional_operations_delegate_when_supported() -> None:
-    """If capability flag is set True but subclass didn't override, raises NotImplementedError."""
+def test_unimplemented_capability_declaration_fails_early() -> None:
+    """Declaring capability without overriding placeholder raises error."""
     adapter = ConcreteTestAdapter(
+        capabilities=AdapterCapabilities(supports_incremental_insert=True)
+    )
+    with pytest.raises(InvalidCapabilityDeclarationError, match="does not override.*insert"):
+        adapter.validate_capabilities()
+
+
+def test_fully_implemented_capabilities_succeed() -> None:
+    """Adapter overriding optional methods validates and executes successfully."""
+    adapter = FullyImplementedAdapter(
         capabilities=AdapterCapabilities(
             supports_incremental_insert=True,
             supports_update=True,
             supports_delete=True,
         )
     )
+    # Validation passes without error
+    adapter.validate_capabilities()
 
     doc = BenchmarkDocument(document_id="d1", title="تستی")
+    res_insert = adapter.insert([doc])
+    assert res_insert.indexed_documents == 1
 
-    with pytest.raises(NotImplementedError, match="insert.*not implemented"):
-        adapter.insert([doc])
+    res_update = adapter.update([doc])
+    assert res_update.indexed_documents == 1
 
-    with pytest.raises(NotImplementedError, match="update.*not implemented"):
-        adapter.update([doc])
-
-    with pytest.raises(NotImplementedError, match="delete.*not implemented"):
-        adapter.delete(["d1"])
+    adapter.delete(["d1"])

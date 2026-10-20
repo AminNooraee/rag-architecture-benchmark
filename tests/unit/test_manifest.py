@@ -56,10 +56,10 @@ def test_manifest_finalize_lifecycle() -> None:
 
 
 def test_manifest_safe_config_no_secrets() -> None:
-    """Manifest benchmark_config must be sanitized without secrets."""
+    """Manifest benchmark_config must be sanitized with secrets redacted."""
     cfg = BenchmarkConfig(
         system="neo4j_graphrag",
-        llm=LLMConfig(model="qwen-72b", endpoint="https://llm.example.com"),
+        llm=LLMConfig(model="qwen-72b", endpoint="https://user:password@llm.example.com"),
     )
     manifest = create_manifest(
         run_id="run-safe-test",
@@ -67,10 +67,8 @@ def test_manifest_safe_config_no_secrets() -> None:
         config=cfg,
     )
 
-    for k in manifest.benchmark_config:
-        assert "key" not in k.lower()
-        assert "secret" not in k.lower()
-        assert "token" not in k.lower()
+    assert "password" not in manifest.benchmark_config["llm"]["endpoint"]
+    assert "[REDACTED]" in manifest.benchmark_config["llm"]["endpoint"]
 
 
 def test_manifest_file_save_and_load_roundtrip(tmp_path: Path) -> None:
@@ -82,7 +80,12 @@ def test_manifest_file_save_and_load_roundtrip(tmp_path: Path) -> None:
         system="traditional_rag",
         metadata={"توضیحات": "اجرای آزمایشی بنچمارک روی دادگان فارسی"},
     )
-    finalized = manifest.finalize(status=RunStatus.COMPLETED, total_queries=10)
+    finalized = manifest.finalize(
+        status=RunStatus.COMPLETED,
+        total_queries=10,
+        successful_queries=10,
+        failed_queries=0,
+    )
 
     save_manifest(finalized, manifest_file)
     assert manifest_file.exists()
