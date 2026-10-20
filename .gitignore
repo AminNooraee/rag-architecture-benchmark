@@ -17,6 +17,7 @@ dist/
 
 # Unit test / coverage
 .pytest_cache/
+.pytest_tmp/
 .mypy_cache/
 .ruff_cache/
 .coverage

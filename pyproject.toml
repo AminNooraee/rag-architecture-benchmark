@@ -50,4 +50,4 @@ disallow_incomplete_defs = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["src"]
-addopts = "-ra -q --strict-markers"
+addopts = "-ra -q --strict-markers --basetemp=.pytest_tmp"
