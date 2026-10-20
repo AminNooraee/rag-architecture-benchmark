@@ -8,8 +8,8 @@ from rag_benchmark.config.models import (
     GenerationConfig,
     LLMConfig,
     RetrievalConfig,
-    sanitize_dict_for_manifest,
 )
+from rag_benchmark.security.sanitizer import sanitize_dict_for_manifest
 
 __all__ = [
     "BenchmarkConfig",
