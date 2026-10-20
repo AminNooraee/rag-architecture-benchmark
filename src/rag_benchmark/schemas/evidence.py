@@ -8,7 +8,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from rag_benchmark.schemas.document import _check_json_serializable
+from rag_benchmark.schemas.strict_json import validate_strict_json_dict
 
 
 class EvidenceType(StrEnum):
@@ -27,7 +27,7 @@ class EvidenceType(StrEnum):
 class RetrievedEvidence(BaseModel):
     """A single unit of retrieved evidence from any RAG architecture."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", validate_assignment=True)
 
     document_id: str | None = Field(
         default=None,
@@ -56,7 +56,7 @@ class RetrievedEvidence(BaseModel):
     )
     metadata: dict[str, Any] = Field(
         default_factory=dict,
-        description="JSON-serializable auxiliary metadata (e.g. node labels, cypher queries).",
+        description="Strict JSON-native auxiliary metadata (e.g. node labels, cypher queries).",
     )
 
     @field_validator("score")
@@ -69,4 +69,4 @@ class RetrievedEvidence(BaseModel):
     @field_validator("metadata")
     @classmethod
     def validate_metadata(cls, v: dict[str, Any]) -> dict[str, Any]:
-        return _check_json_serializable(v, "metadata")
+        return validate_strict_json_dict(v, "metadata")

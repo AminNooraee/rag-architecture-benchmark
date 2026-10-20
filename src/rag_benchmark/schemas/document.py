@@ -2,25 +2,17 @@
 
 from __future__ import annotations
 
-import json
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-
-def _check_json_serializable(value: dict[str, Any], field_name: str) -> dict[str, Any]:
-    """Validate that the dictionary contains only JSON-serializable values."""
-    try:
-        json.dumps(value)
-    except (TypeError, OverflowError, ValueError) as exc:
-        raise ValueError(f"Field '{field_name}' must be JSON-serializable: {exc}") from exc
-    return value
+from rag_benchmark.schemas.strict_json import validate_strict_json_dict
 
 
 class DocumentSection(BaseModel):
     """A distinct structural subsection of a document (e.g., chapter, section, paragraph)."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", validate_assignment=True)
 
     section_id: str = Field(
         ...,
@@ -42,7 +34,7 @@ class DocumentSection(BaseModel):
     )
     metadata: dict[str, Any] = Field(
         default_factory=dict,
-        description="JSON-serializable metadata specific to this section.",
+        description="Strict JSON-native metadata specific to this section.",
     )
 
     @field_validator("section_id")
@@ -55,13 +47,13 @@ class DocumentSection(BaseModel):
     @field_validator("metadata")
     @classmethod
     def validate_metadata(cls, v: dict[str, Any]) -> dict[str, Any]:
-        return _check_json_serializable(v, "metadata")
+        return validate_strict_json_dict(v, "metadata")
 
 
 class BenchmarkDocument(BaseModel):
     """Canonical representation of a document in the Persian RAG benchmark."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", validate_assignment=True)
 
     document_id: str = Field(
         ...,
@@ -95,7 +87,7 @@ class BenchmarkDocument(BaseModel):
     )
     metadata: dict[str, Any] = Field(
         default_factory=dict,
-        description="JSON-serializable metadata associated with the document.",
+        description="Strict JSON-native metadata associated with the document.",
     )
 
     @field_validator("document_id")
@@ -115,4 +107,4 @@ class BenchmarkDocument(BaseModel):
     @field_validator("metadata")
     @classmethod
     def validate_metadata(cls, v: dict[str, Any]) -> dict[str, Any]:
-        return _check_json_serializable(v, "metadata")
+        return validate_strict_json_dict(v, "metadata")

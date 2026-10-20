@@ -11,13 +11,13 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from rag_benchmark.schemas.document import _check_json_serializable
+from rag_benchmark.schemas.strict_json import validate_strict_json_dict
 
 
 class MetricScore(BaseModel):
     """A single evaluation metric score."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", validate_assignment=True)
 
     name: str = Field(
         ..., min_length=1, description="Metric name (e.g. hit_rate@5, mrr, exact_match)."
@@ -38,4 +38,4 @@ class MetricScore(BaseModel):
     @field_validator("metadata")
     @classmethod
     def validate_metadata(cls, v: dict[str, Any]) -> dict[str, Any]:
-        return _check_json_serializable(v, "metadata")
+        return validate_strict_json_dict(v, "metadata")

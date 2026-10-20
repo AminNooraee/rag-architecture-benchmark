@@ -9,16 +9,23 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from rag_benchmark.config.models import BenchmarkConfig
-from rag_benchmark.errors.models import UnsupportedOperationError
+from rag_benchmark.errors.models import (
+    InvalidCapabilityDeclarationError,
+    UnsupportedOperationError,
+)
 from rag_benchmark.schemas.document import BenchmarkDocument
 from rag_benchmark.schemas.question import AdapterQueryInput
 from rag_benchmark.schemas.result import QueryResult
 
 
 class AdapterCapabilities(BaseModel):
-    """Structured declaration of features supported by a RAG system adapter."""
+    """Structured declaration of features supported by a RAG system adapter.
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    Note: Asynchronous execution (supports_async) is intentionally deferred until
+    Phase 4 when an explicit async query contract is scheduled for introduction.
+    """
+
+    model_config = ConfigDict(frozen=True, extra="forbid", validate_assignment=True)
 
     supports_incremental_insert: bool = Field(
         default=False,
@@ -38,10 +45,6 @@ class AdapterCapabilities(BaseModel):
         default=False,
         description="Whether the index is persisted to disk or an external database.",
     )
-    supports_async: bool = Field(
-        default=False,
-        description="Whether the adapter exposes asynchronous query/index paths.",
-    )
     supports_streaming: bool = Field(
         default=False,
         description="Whether the adapter supports token-by-token streaming responses.",
@@ -59,7 +62,7 @@ class AdapterCapabilities(BaseModel):
 class IndexingResult(BaseModel):
     """Summary metrics from document indexing."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", validate_assignment=True)
 
     indexed_documents: int = Field(default=0, ge=0)
     indexed_chunks: int = Field(default=0, ge=0)
@@ -70,7 +73,7 @@ class IndexingResult(BaseModel):
 class HealthCheckResult(BaseModel):
     """Outcome of adapter health and connectivity verification."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", validate_assignment=True)
 
     healthy: bool
     system: str
@@ -116,6 +119,29 @@ class BaseRAGAdapter(ABC):
         """Report features supported by this adapter implementation."""
         ...
 
+    def validate_capabilities(self) -> None:
+        """Verify that any declared capability actually has an overridden implementation.
+
+        Fails early if an adapter advertises capabilities without providing the required
+        methods.
+        """
+        caps = self.capabilities
+        if caps.supports_incremental_insert and type(self).insert is BaseRAGAdapter.insert:
+            raise InvalidCapabilityDeclarationError(
+                f"Adapter '{self.system_name}' declares supports_incremental_insert=True "
+                "but does not override the insert() method."
+            )
+        if caps.supports_update and type(self).update is BaseRAGAdapter.update:
+            raise InvalidCapabilityDeclarationError(
+                f"Adapter '{self.system_name}' declares supports_update=True "
+                "but does not override the update() method."
+            )
+        if caps.supports_delete and type(self).delete is BaseRAGAdapter.delete:
+            raise InvalidCapabilityDeclarationError(
+                f"Adapter '{self.system_name}' declares supports_delete=True "
+                "but does not override the delete() method."
+            )
+
     @abstractmethod
     def prepare(self, config: BenchmarkConfig) -> None:
         """Initialize and configure adapter with benchmark parameters."""
@@ -145,7 +171,7 @@ class BaseRAGAdapter(ABC):
         """Release resources, close connections, or clear temporary structures."""
         ...
 
-    # Optional lifecycle operations (only required if reported in capabilities)
+    # Optional lifecycle operations (only valid if declared in capabilities)
 
     def insert(self, documents: Sequence[BenchmarkDocument]) -> IndexingResult:
         """Incrementally insert documents into an existing index."""

@@ -17,6 +17,11 @@ from rag_benchmark.schemas.result import (
     QueryTiming,
     QueryUsage,
 )
+from rag_benchmark.schemas.strict_json import (
+    strict_json_dumps,
+    validate_strict_json_dict,
+    validate_strict_json_value,
+)
 
 __all__ = [
     "AdapterQueryInput",
@@ -36,4 +41,7 @@ __all__ = [
     "RunManifest",
     "RunStatus",
     "RuntimeMetadata",
+    "strict_json_dumps",
+    "validate_strict_json_dict",
+    "validate_strict_json_value",
 ]

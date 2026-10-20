@@ -2,13 +2,29 @@
 
 from __future__ import annotations
 
+import copy
 from enum import StrEnum
-from typing import Any
+from typing import Any, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from rag_benchmark.schemas.document import _check_json_serializable
+from rag_benchmark.errors.models import GroundTruthLeakageError
 from rag_benchmark.schemas.evidence import RetrievedEvidence
+from rag_benchmark.schemas.strict_json import validate_strict_json_dict
+
+# Prohibited ground-truth fields that must NEVER appear in query_metadata
+PROHIBITED_GROUND_TRUTH_KEYS = {
+    "gold_answer",
+    "reference_answer",
+    "acceptable_answers",
+    "ground_truth",
+    "gold_evidence",
+    "supporting_facts",
+    "supporting_document_ids",
+    "expected_entities",
+    "answer_key",
+    "reference_documents",
+}
 
 
 class QuestionType(StrEnum):
@@ -48,7 +64,7 @@ class AdapterQueryInput(BaseModel):
     acceptable answers, or ground-truth supporting evidence.
     """
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", validate_assignment=True)
 
     question_id: str = Field(
         ...,
@@ -62,7 +78,7 @@ class AdapterQueryInput(BaseModel):
     )
     metadata: dict[str, Any] = Field(
         default_factory=dict,
-        description="Safe query-time metadata (ground-truth excluded).",
+        description="Strict JSON-native query-time metadata (ground-truth strictly excluded).",
     )
 
     @field_validator("question_id")
@@ -82,7 +98,7 @@ class AdapterQueryInput(BaseModel):
     @field_validator("metadata")
     @classmethod
     def validate_metadata(cls, v: dict[str, Any]) -> dict[str, Any]:
-        return _check_json_serializable(v, "metadata")
+        return validate_strict_json_dict(v, "metadata")
 
 
 class BenchmarkQuestion(BaseModel):
@@ -92,7 +108,7 @@ class BenchmarkQuestion(BaseModel):
     Never passed directly to an adapter's query() execution path.
     """
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", validate_assignment=True)
 
     question_id: str = Field(
         ...,
@@ -135,7 +151,10 @@ class BenchmarkQuestion(BaseModel):
     )
     supporting_evidence: list[RetrievedEvidence] = Field(
         default_factory=list,
-        description="Structured ground-truth evidence snippets or entities.",
+        description=(
+            "Structured ground-truth evidence snippets or entities. For unanswerable "
+            "questions, may optionally contain background or distractor corpus passages."
+        ),
     )
     answerable: bool = Field(
         default=True,
@@ -145,9 +164,13 @@ class BenchmarkQuestion(BaseModel):
         default="",
         description="Source dataset or benchmark subset identifier.",
     )
+    query_metadata: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Explicitly allowlisted metadata safe to pass to RAG adapters at query time.",
+    )
     metadata: dict[str, Any] = Field(
         default_factory=dict,
-        description="Evaluation metadata (e.g. human annotator ID, license).",
+        description="Evaluation-only metadata (annotators, metrics). Never sent to adapter.",
     )
 
     @field_validator("question_id")
@@ -171,25 +194,55 @@ class BenchmarkQuestion(BaseModel):
             raise ValueError("reasoning_hops must be non-negative (>= 0)")
         return v
 
+    @field_validator("query_metadata")
+    @classmethod
+    def validate_query_metadata(cls, v: dict[str, Any]) -> dict[str, Any]:
+        return validate_strict_json_dict(v, "query_metadata")
+
     @field_validator("metadata")
     @classmethod
     def validate_metadata(cls, v: dict[str, Any]) -> dict[str, Any]:
-        return _check_json_serializable(v, "metadata")
+        return validate_strict_json_dict(v, "metadata")
+
+    @model_validator(mode="after")
+    def validate_question_semantics(self) -> Self:
+        """Validate logical coherence across benchmark question fields."""
+        # Unanswerable question semantics
+        if self.question_type == QuestionType.UNANSWERABLE:
+            if self.answerable:
+                raise ValueError("Questions of type 'unanswerable' must have answerable=False")
+
+        if not self.answerable:
+            if self.gold_answer and self.gold_answer.strip():
+                raise ValueError("Questions with answerable=False must have an empty gold_answer")
+
+        # Multi-hop question semantics
+        if self.question_type == QuestionType.MULTI_HOP:
+            if self.reasoning_hops < 2:
+                raise ValueError(
+                    f"MULTI_HOP requires reasoning_hops >= 2, got {self.reasoning_hops}"
+                )
+
+        return self
 
     def to_query_input(self) -> AdapterQueryInput:
-        """Strip evaluation ground-truth and generate adapter-safe query input.
+        """Generate adapter-safe query input using explicit query_metadata allowlist.
 
-        This guarantees that gold_answer, acceptable_answers, and supporting
-        evidence cannot accidentally leak into the RAG adapter execution.
+        CRITICAL ARCHITECTURAL CONTRACT:
+        Evaluation metadata (self.metadata), gold answers, and supporting evidence
+        are strictly isolated and never forwarded.
         """
-        # Filter out ground-truth or evaluation keys from metadata if present
-        safe_meta = {
-            k: v
-            for k, v in self.metadata.items()
-            if not k.startswith("eval_") and k not in {"gold", "ground_truth", "answers"}
-        }
+        # Validate that query_metadata does not contain forbidden ground-truth keys
+        for key in self.query_metadata:
+            norm_key = key.strip().lower().replace("-", "_")
+            if norm_key in PROHIBITED_GROUND_TRUTH_KEYS:
+                raise GroundTruthLeakageError(
+                    f"Forbidden ground-truth key '{key}' detected in query_metadata. "
+                    "Evaluation ground-truth must not be passed to RAG adapters."
+                )
+
         return AdapterQueryInput(
             question_id=self.question_id,
             question=self.question,
-            metadata=safe_meta,
+            metadata=copy.deepcopy(self.query_metadata),
         )

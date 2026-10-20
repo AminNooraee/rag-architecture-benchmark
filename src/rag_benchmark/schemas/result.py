@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import math
 from enum import StrEnum
-from typing import Any
+from typing import Any, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from rag_benchmark.errors.models import BenchmarkErrorType, StructuredError
-from rag_benchmark.schemas.document import _check_json_serializable
 from rag_benchmark.schemas.evidence import RetrievedEvidence
+from rag_benchmark.schemas.strict_json import validate_strict_json_dict
+from rag_benchmark.security.sanitizer import sanitize_dict_for_manifest
 
 
 class QueryStatus(StrEnum):
@@ -25,7 +26,7 @@ class QueryStatus(StrEnum):
 class QueryUsage(BaseModel):
     """Resource consumption metrics for a query execution."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", validate_assignment=True)
 
     llm_calls: int = Field(default=0, ge=0, description="Total number of LLM inference calls.")
     embedding_calls: int = Field(
@@ -42,7 +43,7 @@ class QueryUsage(BaseModel):
 class QueryTiming(BaseModel):
     """Latency metrics in milliseconds for a query execution."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", validate_assignment=True)
 
     retrieval_ms: float = Field(
         default=0.0,
@@ -73,7 +74,7 @@ class QueryTiming(BaseModel):
 class QueryResult(BaseModel):
     """Canonical benchmark result for a single question evaluation."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", validate_assignment=True)
 
     question_id: str = Field(
         ...,
@@ -111,7 +112,7 @@ class QueryResult(BaseModel):
     )
     metadata: dict[str, Any] = Field(
         default_factory=dict,
-        description="Additional execution metadata.",
+        description="Strict JSON-native execution metadata.",
     )
     error: StructuredError | None = Field(
         default=None,
@@ -128,7 +129,50 @@ class QueryResult(BaseModel):
     @field_validator("metadata")
     @classmethod
     def validate_metadata(cls, v: dict[str, Any]) -> dict[str, Any]:
-        return _check_json_serializable(v, "metadata")
+        strict = validate_strict_json_dict(v, "metadata")
+        return sanitize_dict_for_manifest(strict)
+
+    @model_validator(mode="after")
+    def validate_state_matrix(self) -> Self:
+        """Validate cross-field state matrix for success vs. failed/error results."""
+        if self.status == QueryStatus.SUCCESS:
+            if self.error is not None:
+                raise ValueError("Successful QueryResult must not contain an error")
+            if self.answer is None:
+                raise ValueError("Successful QueryResult must have a non-None answer string")
+        else:  # FAILED, TIMEOUT, ERROR
+            if self.error is None:
+                raise ValueError(
+                    f"QueryResult with status '{self.status.value}' must include a StructuredError"
+                )
+            if self.answer is not None:
+                raise ValueError(
+                    f"Failed QueryResult (status='{self.status.value}') must have answer=None"
+                )
+            if (
+                self.status == QueryStatus.TIMEOUT
+                and self.error.error_type != BenchmarkErrorType.TIMEOUT
+            ):
+                raise ValueError("QueryResult with status TIMEOUT must have error_type=TIMEOUT")
+
+            # Nested error identity verification
+            if self.error.question_id is not None and self.error.question_id != self.question_id:
+                raise ValueError(
+                    f"Error question_id '{self.error.question_id}' does not match "
+                    f"result question_id '{self.question_id}'"
+                )
+            if self.error.system and self.error.system != self.system:
+                raise ValueError(
+                    f"Error system '{self.error.system}' does not match "
+                    f"result system '{self.system}'"
+                )
+            if self.error.variant and self.error.variant != self.variant:
+                raise ValueError(
+                    f"Error variant '{self.error.variant}' does not match "
+                    f"result variant '{self.variant}'"
+                )
+
+        return self
 
     @classmethod
     def create_success(
@@ -165,12 +209,16 @@ class QueryResult(BaseModel):
         variant: str = "baseline",
         error_type: BenchmarkErrorType = BenchmarkErrorType.UNKNOWN,
         status: QueryStatus = QueryStatus.FAILED,
+        retrieved_evidence: list[RetrievedEvidence] | None = None,
         usage: QueryUsage | None = None,
         timing: QueryTiming | None = None,
         metadata: dict[str, Any] | None = None,
         retry_count: int = 0,
     ) -> QueryResult:
-        """Helper to create a failed QueryResult with structured error details."""
+        """Helper to create a failed QueryResult preserving retrieval evidence and timing."""
+        if status == QueryStatus.SUCCESS:
+            raise ValueError("create_failure() cannot be called with status=QueryStatus.SUCCESS")
+
         err = StructuredError(
             question_id=question_id,
             system=system,
@@ -186,7 +234,7 @@ class QueryResult(BaseModel):
             variant=variant,
             answer=None,
             status=status,
-            retrieved_evidence=[],
+            retrieved_evidence=retrieved_evidence or [],
             usage=usage or QueryUsage(),
             timing=timing or QueryTiming(),
             metadata=metadata or {},
