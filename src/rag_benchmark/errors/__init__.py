@@ -2,6 +2,7 @@
 
 from rag_benchmark.errors.models import (
     ArtifactCollisionError,
+    ArtifactConsistencyError,
     BenchmarkErrorType,
     BenchmarkException,
     ConfigurationError,
@@ -19,6 +20,7 @@ from rag_benchmark.errors.models import (
 
 __all__ = [
     "ArtifactCollisionError",
+    "ArtifactConsistencyError",
     "BenchmarkErrorType",
     "BenchmarkException",
     "ConfigurationError",

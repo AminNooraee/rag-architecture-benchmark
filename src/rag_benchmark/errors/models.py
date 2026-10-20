@@ -173,6 +173,10 @@ class InvalidLifecycleError(BenchmarkException):
     """Raised when an illegal state transition occurs in manifest or writer lifecycle."""
 
 
+class ArtifactConsistencyError(InvalidLifecycleError):
+    """Raised when durable artifacts are malformed, incomplete, or inconsistent on resume."""
+
+
 class IdentityMismatchError(BenchmarkException):
     """Raised when a query result, error, or manifest does not match the bound run identity."""
 

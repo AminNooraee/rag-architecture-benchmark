@@ -6,6 +6,7 @@ import ctypes
 import json
 import os
 import platform
+import uuid
 from datetime import UTC, datetime
 from enum import StrEnum
 from pathlib import Path
@@ -13,6 +14,7 @@ from typing import Any, Self
 
 from rag_benchmark.errors.models import (
     ArtifactCollisionError,
+    ArtifactConsistencyError,
     DuplicateResultError,
     IdentityMismatchError,
     InvalidLifecycleError,
@@ -32,6 +34,15 @@ class WriterMode(StrEnum):
     CREATE = "create"
     RESUME = "resume"
     OVERWRITE = "overwrite"
+
+
+class WriterLifecycle(StrEnum):
+    """Explicit lifecycle states for RunArtifactWriter."""
+
+    NEW = "new"
+    ACTIVE = "active"
+    FINALIZED = "finalized"
+    CLOSED = "closed"
 
 
 def _is_pid_alive(pid: int) -> bool:
@@ -63,9 +74,11 @@ class RunArtifactWriter:
 
     Guarantees:
       - Explicit lifecycle modes: CREATE, RESUME, OVERWRITE
-      - Exclusive single-writer process ownership via writer.lock
+      - Explicit writer lifecycle: NEW -> ACTIVE -> FINALIZED / CLOSED
+      - Exclusive single-writer process ownership with race-safe atomic claim
       - Run identity binding (run_id, system, variant)
-      - Question uniqueness (run_id, question_id) with resume reconstruction
+      - Question uniqueness (run_id, question_id) with strict resume reconstruction
+      - Strict cross-file validation on RESUME (detecting orphan, missing, or corrupt records)
       - Atomic manifest replacement and strict JSON serialization
     """
 
@@ -79,9 +92,9 @@ class RunArtifactWriter:
         self.run_id = run_id
         self.mode = mode
 
-        self._initialized = False
-        self._finalized = False
+        self.lifecycle = WriterLifecycle.NEW
         self._owns_lock = False
+        self._owner_token = uuid.uuid4().hex
 
         self.bound_run_id: str = ""
         self.bound_system: str = ""
@@ -91,6 +104,11 @@ class RunArtifactWriter:
         self._success_count = 0
         self._failed_count = 0
         self._recorded_question_ids: set[str] = set()
+
+    @property
+    def is_active(self) -> bool:
+        """Return True if the writer is actively initialized and holds its lock."""
+        return self.lifecycle == WriterLifecycle.ACTIVE and self._owns_lock
 
     @classmethod
     def create(
@@ -120,58 +138,105 @@ class RunArtifactWriter:
         base_dir: str | Path,
         manifest: RunManifest,
     ) -> RunArtifactWriter:
-        """Overwrite an existing run, replacing all previous artifacts."""
+        """Overwrite an existing run, replacing previous Phase 3A artifacts."""
         writer = cls(base_dir=base_dir, run_id=manifest.run_id, mode=WriterMode.OVERWRITE)
         writer.initialize(manifest)
         return writer
 
     def _acquire_lock(self) -> None:
-        """Acquire exclusive writer ownership of the run directory."""
+        """Acquire exclusive writer ownership of the run directory.
+
+        Employs atomic file creation and race-safe atomic claim file replacement
+        for stale locks, preventing concurrent takeover collisions.
+        """
         self.paths.ensure_directories()
         lock_path = self.paths.lock_path
 
         lock_data = {
+            "owner_token": self._owner_token,
             "pid": os.getpid(),
             "host": platform.node(),
             "acquired_at": datetime.now(UTC).isoformat(),
             "run_id": self.run_id,
         }
 
-        # Attempt atomic file creation
+        # 1. Attempt atomic creation
         try:
             fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 f.write(strict_json_dumps(lock_data))
+                f.flush()
             self._owns_lock = True
             return
         except FileExistsError:
             pass
 
-        # If file exists, check if holder process is still alive on this machine
+        # 2. File exists. Inspect holder process on this host
         is_stale = False
         existing_pid: int | None = None
+        existing_token: str | None = None
         try:
             with open(lock_path, encoding="utf-8") as f:
                 info = json.load(f)
                 existing_pid = info.get("pid")
                 existing_host = info.get("host")
+                existing_token = info.get("owner_token")
                 if existing_host == platform.node() and existing_pid:
                     if not _is_pid_alive(existing_pid):
                         is_stale = True
         except Exception:
+            # File may be mid-creation or unreadable, treat as active to avoid corruption
             pass
 
-        if is_stale:
+        # 3. If process is dead, perform atomic claim takeover
+        if is_stale and existing_pid is not None:
+            claim_id = uuid.uuid4().hex
+            claim_path = lock_path.with_name(f"{lock_path.name}.claim.{claim_id}")
             try:
-                lock_path.unlink()
+                # Atomic rename: moves lock_path to claim_path.
+                # Only ONE process can succeed; contenders receive FileNotFoundError/OSError.
+                os.replace(str(lock_path), str(claim_path))
+            except (FileNotFoundError, OSError) as e:
+                raise WriterConcurrencyError(
+                    f"Failed to claim stale lock for run '{self.run_id}': "
+                    "lock claimed by another process."
+                ) from e
+
+            # Verify the claimed lock was indeed the inspected stale lock
+            try:
+                with open(claim_path, encoding="utf-8") as f:
+                    claim_info = json.load(f)
+                if (
+                    claim_info.get("pid") != existing_pid
+                    or claim_info.get("owner_token") != existing_token
+                ):
+                    raise WriterConcurrencyError(
+                        f"Stale lock for run '{self.run_id}' changed before claim takeover."
+                    )
+            except Exception as e:
+                if isinstance(e, WriterConcurrencyError):
+                    raise
+                raise WriterConcurrencyError(
+                    f"Failed to verify claimed lock for run '{self.run_id}': {e}"
+                ) from e
+            finally:
+                if claim_path.exists():
+                    try:
+                        claim_path.unlink()
+                    except OSError:
+                        pass
+
+            # Atomically establish the new lock with our owner token
+            try:
                 fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR)
                 with os.fdopen(fd, "w", encoding="utf-8") as f:
                     f.write(strict_json_dumps(lock_data))
+                    f.flush()
                 self._owns_lock = True
                 return
             except Exception as e:
                 raise WriterConcurrencyError(
-                    f"Failed to acquire stale lock for run '{self.run_id}': {e}"
+                    f"Failed to establish new lock for run '{self.run_id}' after claim: {e}"
                 ) from e
 
         raise WriterConcurrencyError(
@@ -179,19 +244,44 @@ class RunArtifactWriter:
             "Parallel query workers must route results through the single owning writer."
         )
 
+    def _verify_lock_held(self) -> bool:
+        """Verify that this writer instance still owns the lock file on disk."""
+        if not self._owns_lock:
+            return False
+        if not self.paths.lock_path.exists():
+            return False
+        try:
+            with open(self.paths.lock_path, encoding="utf-8") as f:
+                info = json.load(f)
+                return bool(info.get("owner_token") == self._owner_token)
+        except Exception:
+            return False
+
     def _release_lock(self) -> None:
         """Release the exclusive writer lock if owned by this instance."""
-        if self._owns_lock and self.paths.lock_path.exists():
-            try:
-                self.paths.lock_path.unlink()
-            except OSError:
-                pass
+        if self._owns_lock:
+            if self._verify_lock_held():
+                try:
+                    self.paths.lock_path.unlink()
+                except OSError:
+                    pass
             self._owns_lock = False
 
     def initialize(self, manifest: RunManifest | None = None) -> None:
         """Initialize writer under the configured mode (CREATE, RESUME, or OVERWRITE)."""
-        if self._initialized:
-            raise InvalidLifecycleError(f"Writer for run '{self.run_id}' is already initialized.")
+        if self.lifecycle == WriterLifecycle.CLOSED:
+            raise InvalidLifecycleError(
+                f"Cannot initialize writer for run '{self.run_id}': writer is permanently CLOSED."
+            )
+        if self.lifecycle == WriterLifecycle.FINALIZED:
+            raise InvalidLifecycleError(
+                f"Cannot initialize writer for run '{self.run_id}': writer is FINALIZED."
+            )
+        if self.lifecycle != WriterLifecycle.NEW:
+            raise InvalidLifecycleError(
+                f"Writer for run '{self.run_id}' is already initialized "
+                f"(state: {self.lifecycle.value})."
+            )
 
         self.paths.ensure_directories()
         self._acquire_lock()
@@ -217,7 +307,7 @@ class RunArtifactWriter:
 
                 self._bind_identity(manifest)
                 save_manifest(manifest, self.paths.manifest_path)
-                self._initialized = True
+                self.lifecycle = WriterLifecycle.ACTIVE
 
             elif self.mode == WriterMode.RESUME:
                 if not self.paths.manifest_path.exists():
@@ -235,8 +325,8 @@ class RunArtifactWriter:
                     )
 
                 self._bind_identity(existing_manifest)
-                self._reconstruct_durable_state()
-                self._initialized = True
+                self._reconstruct_and_validate_durable_state()
+                self.lifecycle = WriterLifecycle.ACTIVE
 
             elif self.mode == WriterMode.OVERWRITE:
                 if manifest is None:
@@ -246,7 +336,7 @@ class RunArtifactWriter:
                         f"Manifest run_id '{manifest.run_id}' != writer run_id '{self.run_id}'"
                     )
 
-                # Cleanly remove old results and errors to guarantee clean state
+                # Sequential cleanup of previous Phase 3A artifacts
                 if self.paths.raw_results_path.exists():
                     self.paths.raw_results_path.unlink()
                 if self.paths.errors_path.exists():
@@ -256,9 +346,11 @@ class RunArtifactWriter:
 
                 self._bind_identity(manifest)
                 save_manifest(manifest, self.paths.manifest_path)
-                self._initialized = True
+                self.lifecycle = WriterLifecycle.ACTIVE
+
         except Exception:
             self._release_lock()
+            self.lifecycle = WriterLifecycle.CLOSED
             raise
 
     def _bind_identity(self, manifest: RunManifest) -> None:
@@ -267,35 +359,194 @@ class RunArtifactWriter:
         self.bound_system = manifest.system
         self.bound_variant = manifest.variant
 
-    def _reconstruct_durable_state(self) -> None:
-        """Reconstruct counters and seen question IDs from durable raw_results.jsonl."""
+    def _reconstruct_and_validate_durable_state(self) -> None:
+        """Reconstruct counters and perform consistency checks on durable artifacts."""
         self._query_count = 0
         self._success_count = 0
         self._failed_count = 0
         self._recorded_question_ids.clear()
 
+        expected_errors: dict[str, StructuredError] = {}
+
+        # 1. Parse and validate raw_results.jsonl
         if self.paths.raw_results_path.exists():
-            results = self.read_results()
-            for r in results:
-                self._query_count += 1
-                if r.status == QueryStatus.SUCCESS:
-                    self._success_count += 1
-                else:
-                    self._failed_count += 1
-                self._recorded_question_ids.add(r.question_id)
+            with open(self.paths.raw_results_path, encoding="utf-8") as f:
+                for line_no, line in enumerate(f, 1):
+                    stripped = line.strip()
+                    if not stripped:
+                        raise ArtifactConsistencyError(
+                            f"Corrupt or empty row at line {line_no} in "
+                            f"'{self.paths.raw_results_path}'"
+                        )
+                    try:
+                        data = json.loads(stripped)
+                    except json.JSONDecodeError as e:
+                        raise ArtifactConsistencyError(
+                            f"Malformed JSON at line {line_no} in "
+                            f"'{self.paths.raw_results_path}': {e}"
+                        ) from e
+
+                    try:
+                        res = QueryResult.model_validate(data)
+                    except Exception as e:
+                        raise ArtifactConsistencyError(
+                            f"Invalid QueryResult schema at line {line_no} in "
+                            f"'{self.paths.raw_results_path}': {e}"
+                        ) from e
+
+                    if res.system != self.bound_system:
+                        raise IdentityMismatchError(
+                            f"QueryResult at line {line_no} has foreign system '{res.system}' "
+                            f"!= run system '{self.bound_system}'"
+                        )
+                    if res.variant != self.bound_variant:
+                        raise IdentityMismatchError(
+                            f"QueryResult at line {line_no} has foreign variant '{res.variant}' "
+                            f"!= run variant '{self.bound_variant}'"
+                        )
+
+                    if res.question_id in self._recorded_question_ids:
+                        raise DuplicateResultError(
+                            f"Duplicate question_id '{res.question_id}' at line {line_no} "
+                            "in durable raw_results.jsonl"
+                        )
+
+                    self._recorded_question_ids.add(res.question_id)
+                    self._query_count += 1
+                    if res.status == QueryStatus.SUCCESS:
+                        self._success_count += 1
+                    else:
+                        self._failed_count += 1
+                        if res.error is not None:
+                            if res.error.question_id and res.error.question_id != res.question_id:
+                                raise IdentityMismatchError(
+                                    f"Nested error question_id '{res.error.question_id}' != "
+                                    f"'{res.question_id}' at line {line_no}"
+                                )
+                            if res.error.system and res.error.system != self.bound_system:
+                                raise IdentityMismatchError(
+                                    f"Nested error system '{res.error.system}' != "
+                                    f"'{self.bound_system}' at line {line_no}"
+                                )
+                            if res.error.variant and res.error.variant != self.bound_variant:
+                                raise IdentityMismatchError(
+                                    f"Nested error variant '{res.error.variant}' != "
+                                    f"'{self.bound_variant}' at line {line_no}"
+                                )
+                            expected_errors[res.question_id] = res.error
+                        else:
+                            raise ArtifactConsistencyError(
+                                f"Failed QueryResult at line {line_no} in raw_results.jsonl "
+                                "has error=None"
+                            )
+
+        # 2. Parse and validate errors.jsonl
+        durable_errors: list[StructuredError] = []
+        durable_error_questions: set[str] = set()
+
+        if self.paths.errors_path.exists():
+            with open(self.paths.errors_path, encoding="utf-8") as f:
+                for line_no, line in enumerate(f, 1):
+                    stripped = line.strip()
+                    if not stripped:
+                        raise ArtifactConsistencyError(
+                            f"Corrupt or empty row at line {line_no} in '{self.paths.errors_path}'"
+                        )
+                    try:
+                        data = json.loads(stripped)
+                    except json.JSONDecodeError as e:
+                        raise ArtifactConsistencyError(
+                            f"Malformed JSON at line {line_no} in '{self.paths.errors_path}': {e}"
+                        ) from e
+
+                    try:
+                        err = StructuredError.model_validate(data)
+                    except Exception as e:
+                        raise ArtifactConsistencyError(
+                            f"Invalid StructuredError schema at line {line_no} in "
+                            f"'{self.paths.errors_path}': {e}"
+                        ) from e
+
+                    if err.system and err.system != self.bound_system:
+                        raise IdentityMismatchError(
+                            f"Error at line {line_no} has foreign system '{err.system}' "
+                            f"!= run system '{self.bound_system}'"
+                        )
+                    if err.variant and err.variant != self.bound_variant:
+                        raise IdentityMismatchError(
+                            f"Error at line {line_no} has foreign variant '{err.variant}' "
+                            f"!= run variant '{self.bound_variant}'"
+                        )
+
+                    if err.question_id:
+                        if err.question_id in durable_error_questions:
+                            raise ArtifactConsistencyError(
+                                f"Duplicate error record for question_id '{err.question_id}' "
+                                f"at line {line_no} in errors.jsonl"
+                            )
+                        durable_error_questions.add(err.question_id)
+
+                    durable_errors.append(err)
+
+        # 3. Cross-file consistency checks
+        if (
+            not self.paths.raw_results_path.exists()
+            and self.paths.errors_path.exists()
+            and durable_errors
+        ):
+            raise ArtifactConsistencyError(
+                f"Orphan errors.jsonl exists with {len(durable_errors)} errors "
+                "but raw_results.jsonl is missing"
+            )
+
+        # Missing expected error records for failed results
+        for qid in expected_errors:
+            if qid not in durable_error_questions:
+                raise ArtifactConsistencyError(
+                    f"Missing expected error record in errors.jsonl for failed question '{qid}'"
+                )
+
+        # Orphan error records with question_id not corresponding to failed result
+        failed_qids = set(expected_errors.keys())
+        for err in durable_errors:
+            if err.question_id:
+                if err.question_id not in self._recorded_question_ids:
+                    raise ArtifactConsistencyError(
+                        f"Orphan error record in errors.jsonl: question '{err.question_id}' "
+                        "does not exist in raw_results.jsonl"
+                    )
+                if err.question_id not in failed_qids:
+                    raise ArtifactConsistencyError(
+                        f"Orphan error record in errors.jsonl: question '{err.question_id}' "
+                        "succeeded in raw_results.jsonl"
+                    )
 
     def append_result(self, result: QueryResult) -> None:
         """Append a QueryResult record to raw_results.jsonl.
 
         Validates:
-          - Writer is initialized and actively RUNNING
+          - Writer is in ACTIVE lifecycle and retains valid lock ownership
           - System and variant match bound run identity
           - question_id has not already been recorded for this run
         """
-        if not self._initialized:
-            raise InvalidLifecycleError("Cannot append result: writer is not initialized.")
-        if self._finalized:
-            raise InvalidLifecycleError("Cannot append result: writer has already been finalized.")
+        if self.lifecycle == WriterLifecycle.CLOSED:
+            raise InvalidLifecycleError(
+                f"Cannot append result: writer for run '{self.run_id}' is permanently CLOSED."
+            )
+        if self.lifecycle == WriterLifecycle.FINALIZED:
+            raise InvalidLifecycleError(
+                f"Cannot append result: writer for run '{self.run_id}' has already been finalized."
+            )
+        if self.lifecycle != WriterLifecycle.ACTIVE:
+            raise InvalidLifecycleError(
+                f"Cannot append result: writer is not initialized or active "
+                f"(state: {self.lifecycle.value})."
+            )
+
+        if not self._verify_lock_held():
+            raise WriterConcurrencyError(
+                f"Writer lost lock ownership for run '{self.run_id}'. Mutation rejected."
+            )
 
         # Identity binding verification
         if result.system != self.bound_system:
@@ -346,10 +597,24 @@ class RunArtifactWriter:
 
     def append_error(self, error: StructuredError) -> None:
         """Explicitly append a standalone StructuredError record to errors.jsonl."""
-        if not self._initialized:
-            raise InvalidLifecycleError("Cannot append error: writer is not initialized.")
-        if self._finalized:
-            raise InvalidLifecycleError("Cannot append error: writer has already been finalized.")
+        if self.lifecycle == WriterLifecycle.CLOSED:
+            raise InvalidLifecycleError(
+                f"Cannot append error: writer for run '{self.run_id}' is permanently CLOSED."
+            )
+        if self.lifecycle == WriterLifecycle.FINALIZED:
+            raise InvalidLifecycleError(
+                f"Cannot append error: writer for run '{self.run_id}' has already been finalized."
+            )
+        if self.lifecycle != WriterLifecycle.ACTIVE:
+            raise InvalidLifecycleError(
+                f"Cannot append error: writer is not initialized or active "
+                f"(state: {self.lifecycle.value})."
+            )
+
+        if not self._verify_lock_held():
+            raise WriterConcurrencyError(
+                f"Writer lost lock ownership for run '{self.run_id}'. Mutation rejected."
+            )
 
         if error.system and error.system != self.bound_system:
             raise IdentityMismatchError(
@@ -374,10 +639,24 @@ class RunArtifactWriter:
         status: RunStatus = RunStatus.COMPLETED,
     ) -> RunManifest:
         """Finalize the manifest with status, timestamps, and query totals, releasing the lock."""
-        if not self._initialized:
-            raise InvalidLifecycleError("Cannot finalize: writer is not initialized.")
-        if self._finalized:
-            raise InvalidLifecycleError("Cannot finalize: writer has already been finalized.")
+        if self.lifecycle == WriterLifecycle.CLOSED:
+            raise InvalidLifecycleError(
+                f"Cannot finalize: writer for run '{self.run_id}' is permanently CLOSED."
+            )
+        if self.lifecycle == WriterLifecycle.FINALIZED:
+            raise InvalidLifecycleError(
+                f"Cannot finalize: writer for run '{self.run_id}' has already been finalized."
+            )
+        if self.lifecycle != WriterLifecycle.ACTIVE:
+            raise InvalidLifecycleError(
+                f"Cannot finalize: writer is not initialized or active "
+                f"(state: {self.lifecycle.value})."
+            )
+
+        if not self._verify_lock_held():
+            raise WriterConcurrencyError(
+                f"Writer lost lock ownership for run '{self.run_id}'. Finalize rejected."
+            )
 
         if not self.paths.manifest_path.exists():
             raise FileNotFoundError(
@@ -392,13 +671,15 @@ class RunArtifactWriter:
             failed_queries=self._failed_count,
         )
         save_manifest(finalized, self.paths.manifest_path)
-        self._finalized = True
+        self.lifecycle = WriterLifecycle.FINALIZED
         self._release_lock()
         return finalized
 
     def close(self) -> None:
-        """Release any held locks."""
+        """Permanently close writer and release any held locks."""
         self._release_lock()
+        if self.lifecycle != WriterLifecycle.FINALIZED:
+            self.lifecycle = WriterLifecycle.CLOSED
 
     def __enter__(self) -> Self:
         return self
@@ -413,11 +694,14 @@ class RunArtifactWriter:
 
         results: list[QueryResult] = []
         with open(self.paths.raw_results_path, encoding="utf-8") as f:
-            for line in f:
+            for line_no, line in enumerate(f, 1):
                 stripped = line.strip()
-                if stripped:
-                    data = json.loads(stripped)
-                    results.append(QueryResult.model_validate(data))
+                if not stripped:
+                    raise ArtifactConsistencyError(
+                        f"Empty line at line {line_no} in '{self.paths.raw_results_path}'"
+                    )
+                data = json.loads(stripped)
+                results.append(QueryResult.model_validate(data))
         return results
 
     def read_errors(self) -> list[StructuredError]:
@@ -427,9 +711,12 @@ class RunArtifactWriter:
 
         errors: list[StructuredError] = []
         with open(self.paths.errors_path, encoding="utf-8") as f:
-            for line in f:
+            for line_no, line in enumerate(f, 1):
                 stripped = line.strip()
-                if stripped:
-                    data = json.loads(stripped)
-                    errors.append(StructuredError.model_validate(data))
+                if not stripped:
+                    raise ArtifactConsistencyError(
+                        f"Empty line at line {line_no} in '{self.paths.errors_path}'"
+                    )
+                data = json.loads(stripped)
+                errors.append(StructuredError.model_validate(data))
         return errors

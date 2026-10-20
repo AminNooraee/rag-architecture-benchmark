@@ -34,8 +34,8 @@ All metadata, configuration extras, and diagnostics are recursively limited to J
 - `null`, `boolean`, `integer`, `finite float` (no `NaN`, `Infinity`, or `-Infinity`), `string`
 - `list` of valid JSON values (Python `tuple` and `set` are strictly rejected)
 - `dict` with **string keys only** and valid JSON values
-- Datetimes, custom classes, and uncoerced enums are rejected.
-- Models perform defensive deep copies during validation to guarantee that external post-construction dictionary mutations cannot silently alter validated benchmark states.
+- Datetimes, custom classes, and non-string enums are rejected (`StrEnum` behaves as string and is valid JSON text).
+- Nested structures are returned as recursively immutable representations (`FrozenDict`, `FrozenList`), permanently preventing post-construction in-place mutation (e.g. `metadata["k"] = v` or `metadata["list"].append(...)`).
 
 ### Document Schema (`BenchmarkDocument`, `DocumentSection`)
 Represents source knowledge assets with structural subsections and metadata:
@@ -108,9 +108,11 @@ class BaseRAGAdapter(ABC):
 
 An adapter must **NOT** secretly inject reranking, HyDE, query rewriting, multi-query expansion, or hidden retrieval stages unless explicitly declared in a benchmark variant.
 
-### Capability Trustworthiness
+### Capability Trustworthiness & Activation Lifecycle
 Adapters declare supported features via `AdapterCapabilities` (`supports_incremental_insert`, `supports_update`, `supports_delete`, `supports_persistence`, `supports_streaming`, `supports_native_citations`).
 - **Trustworthiness Check**: Calling `validate_capabilities()` fails early with `InvalidCapabilityDeclarationError` if an adapter advertises a capability without overriding the corresponding base method.
+- **Mandatory Activation**: `BaseRAGAdapter.activate(config)` guarantees that `validate_capabilities()` executes before `prepare(config)`.
+  > All adapters must be activated through the validated lifecycle before health/index/query operations are used by the benchmark runner.
 - *Note*: Asynchronous execution (`supports_async`) is deferred until Phase 4 when an explicit async query contract is scheduled.
 
 ---
@@ -132,7 +134,9 @@ runs/<run_id>/
 ### Single-Writer Concurrency Policy
 > **`RunArtifactWriter` is a single-writer durable artifact sink. Parallel query workers must send completed results to the owning writer rather than opening independent writers for the same run.**
 
-Exclusive process ownership is enforced via `writer.lock`. If another process attempts to open or initialize the run concurrently, `WriterConcurrencyError` is raised. Stale locks from crashed processes on the same host are safely detected and recovered upon resume.
+Exclusive process ownership is enforced via `writer.lock` with a unique owner token. If another process attempts to open or initialize the run concurrently, `WriterConcurrencyError` is raised.
+
+On the same host, stale locks from dead processes are detected via PID inspection and safely taken over using an atomic claim file. Note: In rare cases where an OS PID is recycled and allocated to an unrelated running process, the harness conservatively treats the lock as active to prevent catastrophic concurrent corruption.
 
 ### Safe `run_id` Validation
 To prevent directory traversal and filesystem corruption, `run_id` must be a safe, single-component identifier:
@@ -142,8 +146,8 @@ To prevent directory traversal and filesystem corruption, `run_id` must be a saf
 ### Explicit Lifecycle Modes
 `RunArtifactWriter` enforces three unambiguous modes:
 1. **CREATE**: Fails with `ArtifactCollisionError` if `manifest.json`, `raw_results.jsonl`, or `errors.jsonl` already exists.
-2. **RESUME**: Resumes an actively `RUNNING` run. Reconstructs query counts and recorded question IDs from durable JSONL records. Rejects terminal runs (`COMPLETED` or `FAILED`).
-3. **OVERWRITE**: Atomically clears previous results, errors, and manifest before initializing clean state.
+2. **RESUME**: Resumes an actively `RUNNING` run. Reconstructs query counts and recorded question IDs from durable JSONL records, validating cross-file consistency. Rejects terminal runs (`COMPLETED` or `FAILED`).
+3. **OVERWRITE**: Sequentially clears previous Phase 3A run artifacts (`manifest.json`, `raw_results.jsonl`, `errors.jsonl`) before initializing clean state. *(Note: OVERWRITE currently manages only Phase 3A core artifacts; future phases will extend cleanup for additional metric or index files).*
 
 ### Result Uniqueness & Identity Binding
 Within a single run, each question may have only one canonical final result: `(run_id, question_id)`. Appending duplicate question IDs is rejected. Appended results and errors must match the writer's bound `system` and `variant`.

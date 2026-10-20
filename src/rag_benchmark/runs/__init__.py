@@ -8,11 +8,12 @@ from rag_benchmark.runs.manifest import (
     save_manifest,
 )
 from rag_benchmark.runs.paths import RunPaths, validate_run_id
-from rag_benchmark.runs.writer import RunArtifactWriter, WriterMode
+from rag_benchmark.runs.writer import RunArtifactWriter, WriterLifecycle, WriterMode
 
 __all__ = [
     "RunArtifactWriter",
     "RunPaths",
+    "WriterLifecycle",
     "WriterMode",
     "atomic_write_json",
     "create_manifest",
