@@ -1,0 +1,38 @@
+# Byte-compiled / optimized / C-extensions
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Environments
+.venv/
+env/
+venv/
+ENV/
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+
+# Unit test / coverage
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local configuration and secrets
+.env
+*.env.local
+*.secrets.*
+
+# Editor directories
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Output run artifacts from benchmarks
+/runs/
+!/runs/.gitkeep
