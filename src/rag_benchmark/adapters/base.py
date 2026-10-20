@@ -6,7 +6,7 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from rag_benchmark.config.models import BenchmarkConfig
 from rag_benchmark.errors.models import (
@@ -16,6 +16,8 @@ from rag_benchmark.errors.models import (
 from rag_benchmark.schemas.document import BenchmarkDocument
 from rag_benchmark.schemas.question import AdapterQueryInput
 from rag_benchmark.schemas.result import QueryResult
+from rag_benchmark.schemas.strict_json import validate_strict_json_dict
+from rag_benchmark.security.sanitizer import sanitize_dict_for_manifest
 
 
 class AdapterCapabilities(BaseModel):
@@ -69,6 +71,12 @@ class IndexingResult(BaseModel):
     elapsed_ms: float = Field(default=0.0, ge=0.0)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    @field_validator("metadata")
+    @classmethod
+    def validate_metadata(cls, v: dict[str, Any]) -> dict[str, Any]:
+        strict = validate_strict_json_dict(v, "metadata")
+        return sanitize_dict_for_manifest(strict)
+
 
 class HealthCheckResult(BaseModel):
     """Outcome of adapter health and connectivity verification."""
@@ -79,6 +87,12 @@ class HealthCheckResult(BaseModel):
     system: str
     message: str = "OK"
     details: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("details")
+    @classmethod
+    def validate_details(cls, v: dict[str, Any]) -> dict[str, Any]:
+        strict = validate_strict_json_dict(v, "details")
+        return sanitize_dict_for_manifest(strict)
 
 
 class BaseRAGAdapter(ABC):
@@ -141,6 +155,16 @@ class BaseRAGAdapter(ABC):
                 f"Adapter '{self.system_name}' declares supports_delete=True "
                 "but does not override the delete() method."
             )
+
+    def activate(self, config: BenchmarkConfig) -> None:
+        """Activate the adapter by verifying declared capabilities and preparing resources.
+
+        Guarantees that validate_capabilities() is executed before prepare(config).
+        All adapters must be activated through this validated lifecycle before
+        health/index/query operations are used by the benchmark runner.
+        """
+        self.validate_capabilities()
+        self.prepare(config)
 
     @abstractmethod
     def prepare(self, config: BenchmarkConfig) -> None:
