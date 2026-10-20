@@ -60,6 +60,8 @@ from rag_benchmark.schemas.result import (
     QueryTiming,
 )
 from rag_benchmark.schemas.strict_json import (
+    FrozenDict,
+    FrozenList,
     validate_strict_json_dict,
     validate_strict_json_value,
 )
@@ -70,14 +72,33 @@ from rag_benchmark.security.sanitizer import (
 )
 
 
-def _contender_worker(base_dir_str: str, run_id: str, result_queue: Any) -> None:
-    """Multiprocessing worker contending for a stale lock."""
+def _contender_worker(
+    base_dir_str: str,
+    run_id: str,
+    result_queue: Any,
+    barrier: Any = None,
+) -> None:
+    """Multiprocessing worker contending for a stale lock with optional barrier."""
     try:
+        if barrier is not None:
+            barrier.wait(timeout=5)
         writer = RunArtifactWriter(base_dir=base_dir_str, run_id=run_id, mode=WriterMode.RESUME)
         writer.initialize()
-        result_queue.put(("success", os.getpid(), writer._owner_token))
+        owner_token = writer._owner_token
+        result_queue.put(("success", os.getpid(), owner_token))
+
+        # Hold lock briefly so loser attempts takeover while winner is active
         time.sleep(0.3)
-        writer.close()
+
+        # Mutate while holding ownership
+        res = QueryResult.create_success(
+            question_id="q-race-win",
+            system="traditional_rag",
+            answer="پاسخ پیروز مسابقه",
+        )
+        writer.append_result(res)
+        finalized = writer.finalize(status=RunStatus.COMPLETED)
+        result_queue.put(("finalized", os.getpid(), finalized.status.value, owner_token))
     except WriterConcurrencyError as e:
         result_queue.put(("concurrency_error", os.getpid(), str(e)))
     except Exception as e:
@@ -1034,12 +1055,12 @@ def test_v04_deeply_nested_url_and_dict_redaction() -> None:
 
 
 # -------------------------------------------------------------------------
-# V-05: Race-Safe Stale Lock Takeover
+# V-05: Race-Safe Stale Lock Takeover (V-05A Guard Mutex)
 # -------------------------------------------------------------------------
 
 
 def test_v05_multiprocessing_stale_lock_race(tmp_path: Path) -> None:
-    """V-05: Race on stale lock produces exactly one winner and one concurrency failure."""
+    """V-05A: Synchronized race on stale lock produces one winner and one concurrency failure."""
     run_id = "v05-lock-race"
     paths = RunPaths(tmp_path, run_id)
     paths.ensure_directories()
@@ -1062,9 +1083,16 @@ def test_v05_multiprocessing_stale_lock_race(tmp_path: Path) -> None:
 
     ctx = mp.get_context("spawn")
     result_queue = ctx.Queue()
+    barrier = ctx.Barrier(2)
 
-    p1 = ctx.Process(target=_contender_worker, args=(str(tmp_path), run_id, result_queue))
-    p2 = ctx.Process(target=_contender_worker, args=(str(tmp_path), run_id, result_queue))
+    p1 = ctx.Process(
+        target=_contender_worker,
+        args=(str(tmp_path), run_id, result_queue, barrier),
+    )
+    p2 = ctx.Process(
+        target=_contender_worker,
+        args=(str(tmp_path), run_id, result_queue, barrier),
+    )
 
     p1.start()
     p2.start()
@@ -1081,7 +1109,39 @@ def test_v05_multiprocessing_stale_lock_race(tmp_path: Path) -> None:
     assert "concurrency_error" in statuses, (
         f"Expected one concurrency rejection, got results: {results}"
     )
-    assert len(statuses) == 2
+    assert "finalized" in statuses, f"Expected winner to finalize run, got results: {results}"
+
+    # Verify winner's owner_token matched across success and finalization
+    success_entry = next(r for r in results if r[0] == "success")
+    finalized_entry = next(r for r in results if r[0] == "finalized")
+    assert success_entry[2] == finalized_entry[3]
+
+    # Verify loser never unlinked or replaced winner's lock
+    loaded_manifest = load_manifest(paths.manifest_path)
+    assert loaded_manifest.status == RunStatus.COMPLETED
+    assert loaded_manifest.total_queries == 1
+
+
+def test_v05_normal_concurrent_acquisition_rejected(tmp_path: Path) -> None:
+    """V-05A: Concurrent acquisition on an actively owned run rejects the second writer."""
+    run_id = "v05-active-rejection"
+    manifest = create_manifest(run_id=run_id, system="traditional_rag")
+    writer_1 = RunArtifactWriter.create(base_dir=tmp_path, manifest=manifest)
+    assert str(writer_1.lifecycle) == str(WriterLifecycle.ACTIVE)
+
+    # Attempt second writer initialization on active run
+    with pytest.raises(WriterConcurrencyError, match="owned by active writer"):
+        RunArtifactWriter.resume(base_dir=tmp_path, run_id=run_id)
+
+    # Writer 1 mutates and finalizes cleanly
+    res = QueryResult.create_success(
+        question_id="q-active-1",
+        system="traditional_rag",
+        answer="پاسخ معتبر",
+    )
+    writer_1.append_result(res)
+    finalized = writer_1.finalize(status=RunStatus.COMPLETED)
+    assert finalized.total_queries == 1
 
 
 # -------------------------------------------------------------------------
@@ -1173,6 +1233,142 @@ def test_v07_nested_immutability_frozen_dict_and_list() -> None:
 
     with pytest.raises(TypeError, match="FrozenDict is immutable"):
         q.metadata["eval_dict"]["score"] = 20
+
+
+def test_v07a_complete_frozen_container_mutation_surface() -> None:
+    """V-07A: Verify all mutating methods on FrozenDict and FrozenList raise TypeError."""
+    # 1. Test FrozenDict mutation surface
+    d = FrozenDict({"k": "v", "num": 1})
+    orig_d = dict(d)
+
+    with pytest.raises(TypeError, match="FrozenDict is immutable"):
+        d["new_key"] = "bad"
+    assert d == orig_d
+
+    with pytest.raises(TypeError, match="FrozenDict is immutable"):
+        del d["k"]
+    assert d == orig_d
+
+    with pytest.raises(TypeError, match="FrozenDict is immutable"):
+        d |= {"new_key": "mutated"}
+    assert d == orig_d
+
+    with pytest.raises(TypeError, match="FrozenDict is immutable"):
+        d.clear()
+    assert d == orig_d
+
+    with pytest.raises(TypeError, match="FrozenDict is immutable"):
+        d.pop("k")
+    assert d == orig_d
+
+    with pytest.raises(TypeError, match="FrozenDict is immutable"):
+        d.popitem()
+    assert d == orig_d
+
+    with pytest.raises(TypeError, match="FrozenDict is immutable"):
+        d.setdefault("new_key", "default_val")
+    assert d == orig_d
+
+    with pytest.raises(TypeError, match="FrozenDict is immutable"):
+        d.update({"updated_key": "val"})
+    assert d == orig_d
+
+    # 2. Test FrozenList mutation surface
+    lst = FrozenList(["item1", "item2", "item3"])
+    orig_lst = list(lst)
+
+    with pytest.raises(TypeError, match="FrozenList is immutable"):
+        lst[0] = "mutated"
+    assert lst == orig_lst
+
+    with pytest.raises(TypeError, match="FrozenList is immutable"):
+        del lst[0]
+    assert lst == orig_lst
+
+    with pytest.raises(TypeError, match="FrozenList is immutable"):
+        lst += ["extra"]
+    assert lst == orig_lst
+
+    with pytest.raises(TypeError, match="FrozenList is immutable"):
+        lst *= 2
+    assert lst == orig_lst
+
+    with pytest.raises(TypeError, match="FrozenList is immutable"):
+        lst.append("extra")
+    assert lst == orig_lst
+
+    with pytest.raises(TypeError, match="FrozenList is immutable"):
+        lst.extend(["extra1", "extra2"])
+    assert lst == orig_lst
+
+    with pytest.raises(TypeError, match="FrozenList is immutable"):
+        lst.insert(0, "first")
+    assert lst == orig_lst
+
+    with pytest.raises(TypeError, match="FrozenList is immutable"):
+        lst.pop()
+    assert lst == orig_lst
+
+    with pytest.raises(TypeError, match="FrozenList is immutable"):
+        lst.remove("item1")
+    assert lst == orig_lst
+
+    with pytest.raises(TypeError, match="FrozenList is immutable"):
+        lst.clear()
+    assert lst == orig_lst
+
+    with pytest.raises(TypeError, match="FrozenList is immutable"):
+        lst.reverse()
+    assert lst == orig_lst
+
+    with pytest.raises(TypeError, match="FrozenList is immutable"):
+        lst.sort()
+    assert lst == orig_lst
+
+
+def test_v07a_model_level_immutability_and_json_roundtrip() -> None:
+    """V-07A: Model-level in-place operator tests and full JSON round-trip validation."""
+    doc = BenchmarkDocument(
+        document_id="doc-v07a-test",
+        title="عنوان آزمایش",
+        text="متن اصلی",
+        sections=[DocumentSection(section_id="sec-1", heading="تیتر", text="محتوا")],
+        metadata={"tag": "tech", "items": ["alpha", "beta"]},
+    )
+
+    with pytest.raises(TypeError, match="FrozenDict is immutable"):
+        doc.metadata |= {"new": "bad"}
+
+    with pytest.raises(TypeError, match="FrozenList is immutable"):
+        doc.metadata["items"] *= 2
+
+    # Verify JSON round-trip of the unmutated document
+    doc_json = doc.model_dump_json()
+    reloaded_doc = BenchmarkDocument.model_validate_json(doc_json)
+    assert reloaded_doc == doc
+    assert reloaded_doc.metadata["tag"] == "tech"
+    assert reloaded_doc.metadata["items"] == ["alpha", "beta"]
+
+    # Question model-level operator test
+    q = BenchmarkQuestion(
+        question_id="q-v07a-test",
+        question="پرسش آزمایشی؟",
+        question_type=QuestionType.DIRECT_FACTUAL,
+        scope=QuestionScope.LOCAL,
+        gold_answer="پاسخ",
+        query_metadata={"nums": [1, 2]},
+        metadata={"eval_key": "safe"},
+    )
+
+    with pytest.raises(TypeError, match="FrozenDict is immutable"):
+        q.query_metadata |= {"new_param": 99}
+
+    with pytest.raises(TypeError, match="FrozenList is immutable"):
+        q.query_metadata["nums"] *= 3
+
+    q_json = q.model_dump_json()
+    reloaded_q = BenchmarkQuestion.model_validate_json(q_json)
+    assert reloaded_q == q
 
 
 # -------------------------------------------------------------------------
