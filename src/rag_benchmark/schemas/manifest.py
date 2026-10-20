@@ -1,4 +1,4 @@
-"""Run manifest schema for benchmark reproducibility."""
+"""Run manifest schema for benchmark reproducibility and lifecycle tracking."""
 
 from __future__ import annotations
 
@@ -6,12 +6,13 @@ import platform
 import sys
 from datetime import UTC, datetime
 from enum import StrEnum
-from typing import Any
+from typing import Any, Self
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from rag_benchmark.config.models import sanitize_dict_for_manifest
-from rag_benchmark.schemas.document import _check_json_serializable
+from rag_benchmark.errors.models import InvalidLifecycleError, normalize_datetime_to_utc
+from rag_benchmark.schemas.strict_json import validate_strict_json_dict
+from rag_benchmark.security.sanitizer import sanitize_dict_for_manifest
 
 
 class RunStatus(StrEnum):
@@ -25,7 +26,7 @@ class RunStatus(StrEnum):
 class RuntimeMetadata(BaseModel):
     """Environment and platform details for benchmark reproducibility."""
 
-    model_config = ConfigDict(frozen=True, extra="forbid")
+    model_config = ConfigDict(frozen=True, extra="forbid", validate_assignment=True)
 
     python_version: str = Field(default_factory=lambda: sys.version.split()[0])
     os_name: str = Field(default_factory=platform.system)
@@ -36,13 +37,14 @@ class RuntimeMetadata(BaseModel):
     @field_validator("extra")
     @classmethod
     def validate_extra(cls, v: dict[str, Any]) -> dict[str, Any]:
-        return _check_json_serializable(v, "extra")
+        strict = validate_strict_json_dict(v, "extra")
+        return sanitize_dict_for_manifest(strict)
 
 
 class RunManifest(BaseModel):
     """Reproducible record of a benchmark run execution."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
     run_id: str = Field(
         ...,
@@ -117,16 +119,52 @@ class RunManifest(BaseModel):
             raise ValueError("Field cannot be empty or whitespace only")
         return v
 
+    @field_validator("started_at", mode="before")
+    @classmethod
+    def validate_started_at(cls, v: Any) -> datetime:
+        return normalize_datetime_to_utc(v)
+
+    @field_validator("finished_at", mode="before")
+    @classmethod
+    def validate_finished_at(cls, v: Any) -> datetime | None:
+        if v is None:
+            return None
+        return normalize_datetime_to_utc(v)
+
     @field_validator("benchmark_config")
     @classmethod
     def validate_sanitized_config(cls, v: dict[str, Any]) -> dict[str, Any]:
-        _check_json_serializable(v, "benchmark_config")
-        return sanitize_dict_for_manifest(v)
+        strict = validate_strict_json_dict(v, "benchmark_config")
+        return sanitize_dict_for_manifest(strict)
 
     @field_validator("metadata")
     @classmethod
     def validate_metadata(cls, v: dict[str, Any]) -> dict[str, Any]:
-        return _check_json_serializable(v, "metadata")
+        strict = validate_strict_json_dict(v, "metadata")
+        return sanitize_dict_for_manifest(strict)
+
+    @model_validator(mode="after")
+    def validate_lifecycle_invariants(self) -> Self:
+        """Enforce strict lifecycle and counter invariants across fields."""
+        if self.status == RunStatus.RUNNING:
+            if self.finished_at is not None:
+                raise ValueError("finished_at must be None while manifest status is RUNNING")
+        else:  # COMPLETED or FAILED
+            if self.finished_at is None:
+                raise ValueError(
+                    f"finished_at must be set when status is terminal '{self.status.value}'"
+                )
+            if self.finished_at < self.started_at:
+                raise ValueError(
+                    f"finished_at ({self.finished_at.isoformat()}) earlier than "
+                    f"started_at ({self.started_at.isoformat()})"
+                )
+            if self.total_queries != self.successful_queries + self.failed_queries:
+                raise ValueError(
+                    f"Terminal count mismatch: total ({self.total_queries}) != "
+                    f"success ({self.successful_queries}) + failed ({self.failed_queries})"
+                )
+        return self
 
     def finalize(
         self,
@@ -135,16 +173,28 @@ class RunManifest(BaseModel):
         successful_queries: int | None = None,
         failed_queries: int | None = None,
     ) -> RunManifest:
-        """Create a finalized copy of this manifest with completed/failed status."""
-        updates: dict[str, Any] = {
-            "status": status,
-            "finished_at": datetime.now(UTC),
-        }
-        if total_queries is not None:
-            updates["total_queries"] = total_queries
-        if successful_queries is not None:
-            updates["successful_queries"] = successful_queries
-        if failed_queries is not None:
-            updates["failed_queries"] = failed_queries
+        """Create a finalized copy of this manifest with completed/failed status.
 
-        return self.model_copy(update=updates)
+        Validates all transitions: only RUNNING -> COMPLETED or RUNNING -> FAILED are allowed.
+        """
+        if self.status != RunStatus.RUNNING:
+            raise InvalidLifecycleError(
+                f"Cannot finalize: current status is already terminal '{self.status.value}'"
+            )
+
+        if status == RunStatus.RUNNING:
+            raise InvalidLifecycleError("Cannot finalize manifest to RUNNING status")
+
+        raw_data = self.model_dump()
+        raw_data["status"] = status
+        raw_data["finished_at"] = datetime.now(UTC)
+
+        if total_queries is not None:
+            raw_data["total_queries"] = total_queries
+        if successful_queries is not None:
+            raw_data["successful_queries"] = successful_queries
+        if failed_queries is not None:
+            raw_data["failed_queries"] = failed_queries
+
+        # Instantiate fresh instance to run full validator suite
+        return RunManifest.model_validate(raw_data)

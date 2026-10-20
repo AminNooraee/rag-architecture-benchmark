@@ -13,12 +13,26 @@ from rag_benchmark.errors.models import (
     BenchmarkErrorType,
     BenchmarkException,
     ConfigurationError,
+    DuplicateResultError,
+    GroundTruthLeakageError,
+    IdentityMismatchError,
+    InvalidCapabilityDeclarationError,
+    InvalidLifecycleError,
+    InvalidRunIdError,
     StructuredError,
     UnsupportedOperationError,
+    WriterConcurrencyError,
+    normalize_datetime_to_utc,
 )
-from rag_benchmark.runs.manifest import create_manifest, load_manifest, save_manifest
-from rag_benchmark.runs.paths import RunPaths
-from rag_benchmark.runs.writer import RunArtifactWriter
+from rag_benchmark.runs.manifest import (
+    atomic_write_json,
+    create_manifest,
+    get_git_commit,
+    load_manifest,
+    save_manifest,
+)
+from rag_benchmark.runs.paths import RunPaths, validate_run_id
+from rag_benchmark.runs.writer import RunArtifactWriter, WriterMode
 from rag_benchmark.schemas.document import BenchmarkDocument, DocumentSection
 from rag_benchmark.schemas.evidence import EvidenceType, RetrievedEvidence
 from rag_benchmark.schemas.manifest import RunManifest, RunStatus, RuntimeMetadata
@@ -35,10 +49,23 @@ from rag_benchmark.schemas.result import (
     QueryTiming,
     QueryUsage,
 )
+from rag_benchmark.schemas.strict_json import (
+    strict_json_dumps,
+    validate_strict_json_dict,
+    validate_strict_json_value,
+)
+from rag_benchmark.security.sanitizer import (
+    REDACTED_STR,
+    is_sensitive_key,
+    sanitize_dict_for_manifest,
+    sanitize_error_message,
+    sanitize_url,
+)
 
 __version__ = "0.1.0"
 
 __all__ = [
+    "REDACTED_STR",
     "AdapterCapabilities",
     "AdapterQueryInput",
     "ArtifactCollisionError",
@@ -51,9 +78,15 @@ __all__ = [
     "ConfigurationError",
     "DifficultyLevel",
     "DocumentSection",
+    "DuplicateResultError",
     "EvidenceType",
+    "GroundTruthLeakageError",
     "HealthCheckResult",
+    "IdentityMismatchError",
     "IndexingResult",
+    "InvalidCapabilityDeclarationError",
+    "InvalidLifecycleError",
+    "InvalidRunIdError",
     "QueryResult",
     "QueryStatus",
     "QueryTiming",
@@ -68,8 +101,21 @@ __all__ = [
     "RuntimeMetadata",
     "StructuredError",
     "UnsupportedOperationError",
+    "WriterConcurrencyError",
+    "WriterMode",
+    "atomic_write_json",
     "create_manifest",
+    "get_git_commit",
+    "is_sensitive_key",
     "load_config",
     "load_manifest",
+    "normalize_datetime_to_utc",
     "save_manifest",
+    "sanitize_dict_for_manifest",
+    "sanitize_error_message",
+    "sanitize_url",
+    "strict_json_dumps",
+    "validate_run_id",
+    "validate_strict_json_dict",
+    "validate_strict_json_value",
 ]
