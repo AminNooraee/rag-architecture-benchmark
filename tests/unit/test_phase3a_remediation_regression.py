@@ -3,6 +3,11 @@
 from __future__ import annotations
 
 import json
+import multiprocessing as mp
+import os
+import platform
+import time
+import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -20,6 +25,7 @@ from rag_benchmark.adapters.base import (
 from rag_benchmark.config.models import BenchmarkConfig
 from rag_benchmark.errors.models import (
     ArtifactCollisionError,
+    ArtifactConsistencyError,
     BenchmarkErrorType,
     ConfigurationError,
     DuplicateResultError,
@@ -34,12 +40,14 @@ from rag_benchmark.errors.models import (
 from rag_benchmark.runs.manifest import (
     atomic_write_json,
     create_manifest,
+    load_manifest,
+    save_manifest,
 )
 from rag_benchmark.runs.paths import RunPaths, validate_run_id
-from rag_benchmark.runs.writer import RunArtifactWriter, WriterMode
-from rag_benchmark.schemas.document import BenchmarkDocument
+from rag_benchmark.runs.writer import RunArtifactWriter, WriterLifecycle, WriterMode
+from rag_benchmark.schemas.document import BenchmarkDocument, DocumentSection
 from rag_benchmark.schemas.evidence import EvidenceType, RetrievedEvidence
-from rag_benchmark.schemas.manifest import RunStatus
+from rag_benchmark.schemas.manifest import RunManifest, RunStatus
 from rag_benchmark.schemas.question import (
     AdapterQueryInput,
     BenchmarkQuestion,
@@ -58,7 +66,23 @@ from rag_benchmark.schemas.strict_json import (
 from rag_benchmark.security.sanitizer import (
     REDACTED_STR,
     sanitize_dict_for_manifest,
+    sanitize_value,
 )
+
+
+def _contender_worker(base_dir_str: str, run_id: str, result_queue: Any) -> None:
+    """Multiprocessing worker contending for a stale lock."""
+    try:
+        writer = RunArtifactWriter(base_dir=base_dir_str, run_id=run_id, mode=WriterMode.RESUME)
+        writer.initialize()
+        result_queue.put(("success", os.getpid(), writer._owner_token))
+        time.sleep(0.3)
+        writer.close()
+    except WriterConcurrencyError as e:
+        result_queue.put(("concurrency_error", os.getpid(), str(e)))
+    except Exception as e:
+        result_queue.put(("error", os.getpid(), f"{type(e).__name__}: {e}"))
+
 
 # -------------------------------------------------------------------------
 # F-01: Safe run_id / Path Traversal
@@ -656,3 +680,562 @@ def test_regression_adapter_capability_contract_validation() -> None:
     bad = BadAdapter()
     with pytest.raises(InvalidCapabilityDeclarationError, match="does not override.*update"):
         bad.validate_capabilities()
+
+
+# =========================================================================
+# FINAL VERIFICATION PASS: V-01 THROUGH V-08
+# =========================================================================
+
+# -------------------------------------------------------------------------
+# V-01: Writer Must Become Permanently CLOSED
+# -------------------------------------------------------------------------
+
+
+def test_v01_writer_explicit_close_transitions_to_closed(tmp_path: Path) -> None:
+    """V-01: Explicit close transitions writer to CLOSED and blocks further mutations."""
+    run_id = "v01-explicit-close"
+    manifest = create_manifest(run_id=run_id, system="traditional_rag")
+    writer = RunArtifactWriter.create(base_dir=tmp_path, manifest=manifest)
+    assert str(writer.lifecycle) == str(WriterLifecycle.ACTIVE)
+
+    res = QueryResult.create_success(question_id="q-1", system="traditional_rag", answer="پاسخ ۱")
+    writer.append_result(res)
+
+    writer.close()
+    assert str(writer.lifecycle) == str(WriterLifecycle.CLOSED)
+    assert not writer.is_active
+
+    res2 = QueryResult.create_success(question_id="q-2", system="traditional_rag", answer="پاسخ ۲")
+    with pytest.raises(InvalidLifecycleError, match="permanently CLOSED"):
+        writer.append_result(res2)
+
+    err = StructuredError(system="traditional_rag", message="خطای آزمایشی")
+    with pytest.raises(InvalidLifecycleError, match="permanently CLOSED"):
+        writer.append_error(err)
+
+    with pytest.raises(InvalidLifecycleError, match="permanently CLOSED"):
+        writer.finalize()
+
+    with pytest.raises(InvalidLifecycleError, match="permanently CLOSED"):
+        writer.initialize(manifest)
+
+
+def test_v01_writer_context_manager_exit_permanently_closes(tmp_path: Path) -> None:
+    """V-01: Context manager exit closes the writer permanently."""
+    run_id = "v01-ctx-exit"
+    manifest = create_manifest(run_id=run_id, system="traditional_rag")
+
+    with RunArtifactWriter.create(base_dir=tmp_path, manifest=manifest) as writer:
+        res = QueryResult.create_success(
+            question_id="q-1", system="traditional_rag", answer="پاسخ ۱"
+        )
+        writer.append_result(res)
+        assert str(writer.lifecycle) == str(WriterLifecycle.ACTIVE)
+
+    assert str(writer.lifecycle) == str(WriterLifecycle.CLOSED)
+    res2 = QueryResult.create_success(question_id="q-2", system="traditional_rag", answer="پاسخ ۲")
+    with pytest.raises(InvalidLifecycleError, match="permanently CLOSED"):
+        writer.append_result(res2)
+
+
+def test_v01_writer_a_closes_writer_b_resumes_writer_a_mutation_blocked(tmp_path: Path) -> None:
+    """V-01: Writer A closes, Writer B resumes; Writer A attempts mutation and must fail."""
+    run_id = "v01-a-closes-b-resumes"
+    manifest = create_manifest(run_id=run_id, system="traditional_rag")
+
+    writer_a = RunArtifactWriter.create(base_dir=tmp_path, manifest=manifest)
+    res_1 = QueryResult.create_success(question_id="q-1", system="traditional_rag", answer="پاسخ ۱")
+    writer_a.append_result(res_1)
+
+    # Writer A closes and releases lock
+    writer_a.close()
+    assert writer_a.lifecycle == WriterLifecycle.CLOSED
+
+    # Writer B resumes the run and acquires lock
+    writer_b = RunArtifactWriter.resume(base_dir=tmp_path, run_id=run_id)
+    assert writer_b.lifecycle == WriterLifecycle.ACTIVE
+
+    res_2 = QueryResult.create_success(question_id="q-2", system="traditional_rag", answer="پاسخ ۲")
+    writer_b.append_result(res_2)
+
+    # Writer A attempts mutation: MUST fail with InvalidLifecycleError
+    res_a_late = QueryResult.create_success(
+        question_id="q-3", system="traditional_rag", answer="پاسخ دیررس"
+    )
+    with pytest.raises(InvalidLifecycleError, match="permanently CLOSED"):
+        writer_a.append_result(res_a_late)
+
+    # Writer B finalizes the run cleanly
+    finalized = writer_b.finalize(status=RunStatus.COMPLETED)
+    assert finalized.total_queries == 2
+    assert finalized.successful_queries == 2
+
+
+# -------------------------------------------------------------------------
+# V-02: RESUME Must Validate All Durable Artifacts
+# -------------------------------------------------------------------------
+
+
+def test_v02_resume_truncated_raw_results_aborts(tmp_path: Path) -> None:
+    """V-02: Truncated JSONL record in raw_results.jsonl must abort RESUME loudly."""
+    run_id = "v02-truncated-raw"
+    manifest = create_manifest(run_id=run_id, system="traditional_rag")
+    writer = RunArtifactWriter.create(base_dir=tmp_path, manifest=manifest)
+    res = QueryResult.create_success(question_id="q-1", system="traditional_rag", answer="پاسخ")
+    writer.append_result(res)
+    writer.close()
+
+    # Append half a JSON line (simulating crash during write)
+    paths = RunPaths(tmp_path, run_id)
+    with open(paths.raw_results_path, "a", encoding="utf-8") as f:
+        f.write('{"question_id": "q-2", "system": "traditional_rag"\n')
+
+    with pytest.raises(ArtifactConsistencyError, match="Malformed JSON at line 2"):
+        RunArtifactWriter.resume(base_dir=tmp_path, run_id=run_id)
+
+
+def test_v02_resume_empty_blank_line_aborts(tmp_path: Path) -> None:
+    """V-02: Empty/corrupt blank row in raw_results.jsonl must abort RESUME loudly."""
+    run_id = "v02-blank-row"
+    manifest = create_manifest(run_id=run_id, system="traditional_rag")
+    writer = RunArtifactWriter.create(base_dir=tmp_path, manifest=manifest)
+    res = QueryResult.create_success(question_id="q-1", system="traditional_rag", answer="پاسخ")
+    writer.append_result(res)
+    writer.close()
+
+    # Append empty row
+    paths = RunPaths(tmp_path, run_id)
+    with open(paths.raw_results_path, "a", encoding="utf-8") as f:
+        f.write("\n")
+
+    with pytest.raises(ArtifactConsistencyError, match="Corrupt or empty row at line 2"):
+        RunArtifactWriter.resume(base_dir=tmp_path, run_id=run_id)
+
+
+def test_v02_resume_duplicate_question_id_aborts(tmp_path: Path) -> None:
+    """V-02: Duplicate question IDs in durable raw_results.jsonl must abort RESUME loudly."""
+    run_id = "v02-dup-qid"
+    manifest = create_manifest(run_id=run_id, system="traditional_rag")
+    writer = RunArtifactWriter.create(base_dir=tmp_path, manifest=manifest)
+    res1 = QueryResult.create_success(
+        question_id="q-dup", system="traditional_rag", answer="پاسخ ۱"
+    )
+    writer.append_result(res1)
+    writer.close()
+
+    # Artificially inject duplicate question_id
+    paths = RunPaths(tmp_path, run_id)
+    res2 = QueryResult.create_success(
+        question_id="q-dup", system="traditional_rag", answer="پاسخ ۲"
+    )
+    with open(paths.raw_results_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(res2.model_dump(mode="json")) + "\n")
+
+    with pytest.raises(DuplicateResultError, match="Duplicate question_id 'q-dup'"):
+        RunArtifactWriter.resume(base_dir=tmp_path, run_id=run_id)
+
+
+def test_v02_resume_foreign_system_or_variant_aborts(tmp_path: Path) -> None:
+    """V-02: Foreign system or variant result must abort RESUME loudly."""
+    run_id = "v02-foreign-id"
+    manifest = create_manifest(run_id=run_id, system="traditional_rag", variant="v1")
+    writer = RunArtifactWriter.create(base_dir=tmp_path, manifest=manifest)
+    writer.close()
+
+    paths = RunPaths(tmp_path, run_id)
+    foreign_res = QueryResult.create_success(
+        question_id="q-1", system="lightrag", variant="v1", answer="پاسخ"
+    )
+    with open(paths.raw_results_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(foreign_res.model_dump(mode="json")) + "\n")
+
+    with pytest.raises(IdentityMismatchError, match="foreign system 'lightrag'"):
+        RunArtifactWriter.resume(base_dir=tmp_path, run_id=run_id)
+
+
+def test_v02_resume_malformed_errors_aborts(tmp_path: Path) -> None:
+    """V-02: Malformed errors.jsonl must abort RESUME loudly."""
+    run_id = "v02-malformed-errors"
+    manifest = create_manifest(run_id=run_id, system="traditional_rag")
+    writer = RunArtifactWriter.create(base_dir=tmp_path, manifest=manifest)
+    writer.close()
+
+    paths = RunPaths(tmp_path, run_id)
+    with open(paths.errors_path, "w", encoding="utf-8") as f:
+        f.write('{"invalid_json": true\n')
+
+    with pytest.raises(ArtifactConsistencyError, match="Malformed JSON"):
+        RunArtifactWriter.resume(base_dir=tmp_path, run_id=run_id)
+
+
+def test_v02_resume_missing_expected_error_aborts(tmp_path: Path) -> None:
+    """V-02: Failed query result with missing error in errors.jsonl must abort RESUME."""
+    run_id = "v02-missing-error"
+    manifest = create_manifest(run_id=run_id, system="traditional_rag")
+    writer = RunArtifactWriter.create(base_dir=tmp_path, manifest=manifest)
+
+    res = QueryResult.create_failure(
+        question_id="q-fail",
+        system="traditional_rag",
+        error_message="شکست خط لوله",
+        status=QueryStatus.FAILED,
+    )
+    writer.append_result(res)
+    writer.close()
+
+    # Clear errors.jsonl to simulate missing error record
+    paths = RunPaths(tmp_path, run_id)
+    paths.errors_path.unlink()
+
+    with pytest.raises(ArtifactConsistencyError, match="Missing expected error record"):
+        RunArtifactWriter.resume(base_dir=tmp_path, run_id=run_id)
+
+
+def test_v02_resume_orphan_error_aborts(tmp_path: Path) -> None:
+    """V-02: Orphan error in errors.jsonl for question not failed must abort RESUME."""
+    run_id = "v02-orphan-error"
+    manifest = create_manifest(run_id=run_id, system="traditional_rag")
+    writer = RunArtifactWriter.create(base_dir=tmp_path, manifest=manifest)
+    res = QueryResult.create_success(
+        question_id="q-ok", system="traditional_rag", answer="پاسخ موفق"
+    )
+    writer.append_result(res)
+    writer.close()
+
+    # Artificially inject an error for question q-ok (which succeeded)
+    paths = RunPaths(tmp_path, run_id)
+    orphan_err = StructuredError(
+        question_id="q-ok", system="traditional_rag", message="خطای نامعتبر"
+    )
+    with open(paths.errors_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(orphan_err.model_dump(mode="json")) + "\n")
+
+    with pytest.raises(ArtifactConsistencyError, match="Orphan error record.*succeeded"):
+        RunArtifactWriter.resume(base_dir=tmp_path, run_id=run_id)
+
+
+def test_v02_resume_duplicate_error_record_aborts(tmp_path: Path) -> None:
+    """V-02: Duplicate error records for same question_id in errors.jsonl must abort RESUME."""
+    run_id = "v02-dup-error"
+    manifest = create_manifest(run_id=run_id, system="traditional_rag")
+    writer = RunArtifactWriter.create(base_dir=tmp_path, manifest=manifest)
+
+    res = QueryResult.create_failure(
+        question_id="q-fail",
+        system="traditional_rag",
+        error_message="شکست",
+        status=QueryStatus.FAILED,
+    )
+    writer.append_result(res)
+    writer.close()
+
+    # Inject duplicate error record in errors.jsonl
+    paths = RunPaths(tmp_path, run_id)
+    assert res.error is not None
+    with open(paths.errors_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(res.error.model_dump(mode="json")) + "\n")
+
+    with pytest.raises(ArtifactConsistencyError, match="Duplicate error record"):
+        RunArtifactWriter.resume(base_dir=tmp_path, run_id=run_id)
+
+
+# -------------------------------------------------------------------------
+# V-03: Make RunManifest Truly Safe Against Update Bypass
+# -------------------------------------------------------------------------
+
+
+def test_v03_manifest_immutable_and_model_copy_update_validation() -> None:
+    """V-03: RunManifest is frozen and model_copy(update=...) re-validates invariants."""
+    manifest = create_manifest(run_id="v03-copy-val", system="traditional_rag")
+
+    # Direct mutation blocked
+    with pytest.raises(ValidationError):
+        manifest.total_queries = 10
+
+    # Negative counters via model_copy(update=...) blocked
+    with pytest.raises(ValidationError, match="greater than or equal to 0"):
+        manifest.model_copy(update={"total_queries": -1})
+
+    # COMPLETED status without finished_at via model_copy(update=...) blocked
+    with pytest.raises(ValidationError, match="finished_at must be set"):
+        manifest.model_copy(update={"status": RunStatus.COMPLETED, "finished_at": None})
+
+    # Conflicting benchmark_config identity via model_copy(update=...) blocked
+    with pytest.raises(ValidationError, match="contradicts benchmark_config.system"):
+        manifest.model_copy(update={"benchmark_config": {"system": "other_system"}})
+
+
+def test_v03_save_manifest_revalidates_completely(tmp_path: Path) -> None:
+    """V-03: save_manifest() re-validates manifest before atomic serialization."""
+    manifest = create_manifest(run_id="v03-save-val", system="traditional_rag")
+    manifest_path = tmp_path / "manifest.json"
+
+    # Valid save succeeds
+    save_manifest(manifest, manifest_path)
+    assert manifest_path.exists()
+
+    # Loaded manifest is strictly validated
+    loaded = load_manifest(manifest_path)
+    assert loaded.run_id == "v03-save-val"
+
+
+# -------------------------------------------------------------------------
+# V-04: Fully Recursive Secret Sanitization
+# -------------------------------------------------------------------------
+
+
+def test_v04_deeply_nested_url_and_dict_redaction() -> None:
+    """V-04: Recursively sanitize canary credentials in arbitrary nested dicts, lists, and URLs."""
+    canary = "CANARY_SECRET_XYZ"
+    data = {
+        "urls": [
+            f"https://user:{canary}@host/path?token={canary}",
+            "https://safe.example.com/api",
+        ],
+        "nested_levels": [
+            {
+                "branches": [
+                    {
+                        "api_key": canary,
+                        "password": canary,
+                        "normal_info": "اطلاعات مجاز",
+                    }
+                ]
+            }
+        ],
+        "legitimate_fields": {
+            "author": "امین نورایی",
+            "tokenizer": "cl100k_base",
+            "tokenizer_name": "persian_bpe",
+            "authorization_mode": "bearer_standard",
+            "token_count": 512,
+            "input_tokens": 100,
+            "output_tokens": 50,
+        },
+    }
+
+    sanitized = sanitize_value(data)
+
+    # Convert to serialized string to verify no trace of canary exists
+    serialized = json.dumps(sanitized)
+    assert canary not in serialized
+    assert "https://user:[REDACTED]@host/path?token=" in serialized
+    assert "[REDACTED]" in serialized
+
+    # Verify legitimate fields are strictly preserved
+    legit = sanitized["legitimate_fields"]
+    assert legit["author"] == "امین نورایی"
+    assert legit["tokenizer"] == "cl100k_base"
+    assert legit["tokenizer_name"] == "persian_bpe"
+    assert legit["authorization_mode"] == "bearer_standard"
+    assert legit["token_count"] == 512
+    assert legit["input_tokens"] == 100
+    assert legit["output_tokens"] == 50
+
+
+# -------------------------------------------------------------------------
+# V-05: Race-Safe Stale Lock Takeover
+# -------------------------------------------------------------------------
+
+
+def test_v05_multiprocessing_stale_lock_race(tmp_path: Path) -> None:
+    """V-05: Race on stale lock produces exactly one winner and one concurrency failure."""
+    run_id = "v05-lock-race"
+    paths = RunPaths(tmp_path, run_id)
+    paths.ensure_directories()
+
+    manifest = create_manifest(run_id=run_id, system="traditional_rag")
+    save_manifest(manifest, paths.manifest_path)
+
+    # Plant a stale lock with dead PID 999999
+    dead_pid = 999999
+    stale_token = str(uuid.uuid4())
+    lock_data = {
+        "owner_token": stale_token,
+        "pid": dead_pid,
+        "host": platform.node(),
+        "acquired_at": datetime.now(UTC).isoformat(),
+        "run_id": run_id,
+    }
+    with open(paths.lock_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(lock_data))
+
+    ctx = mp.get_context("spawn")
+    result_queue = ctx.Queue()
+
+    p1 = ctx.Process(target=_contender_worker, args=(str(tmp_path), run_id, result_queue))
+    p2 = ctx.Process(target=_contender_worker, args=(str(tmp_path), run_id, result_queue))
+
+    p1.start()
+    p2.start()
+
+    p1.join(timeout=10)
+    p2.join(timeout=10)
+
+    results = []
+    while not result_queue.empty():
+        results.append(result_queue.get_nowait())
+
+    statuses = [r[0] for r in results]
+    assert "success" in statuses, f"Expected one successful takeover, got results: {results}"
+    assert "concurrency_error" in statuses, (
+        f"Expected one concurrency rejection, got results: {results}"
+    )
+    assert len(statuses) == 2
+
+
+# -------------------------------------------------------------------------
+# V-06: Enforce Manifest/Config Identity in RunManifest Itself
+# -------------------------------------------------------------------------
+
+
+def test_v06_manifest_config_identity_validation() -> None:
+    """V-06: Direct RunManifest construction rejects contradictory benchmark_config identity."""
+    # Contradictory system
+    with pytest.raises(ValidationError, match="contradicts benchmark_config.system"):
+        RunManifest(
+            run_id="v06-id-1",
+            system="traditional_rag",
+            variant="baseline",
+            benchmark_config={"system": "lightrag", "variant": "baseline"},
+            status=RunStatus.RUNNING,
+        )
+
+    # Contradictory variant
+    with pytest.raises(ValidationError, match="contradicts benchmark_config.variant"):
+        RunManifest(
+            run_id="v06-id-2",
+            system="traditional_rag",
+            variant="baseline",
+            benchmark_config={"system": "traditional_rag", "variant": "graph_v2"},
+            status=RunStatus.RUNNING,
+        )
+
+    # Consistent identity succeeds
+    valid_manifest = RunManifest(
+        run_id="v06-id-valid",
+        system="traditional_rag",
+        variant="baseline",
+        benchmark_config={"system": "traditional_rag", "variant": "baseline"},
+        status=RunStatus.RUNNING,
+    )
+    assert valid_manifest.system == "traditional_rag"
+
+
+# -------------------------------------------------------------------------
+# V-07: Fix or Clarify Nested Immutability
+# -------------------------------------------------------------------------
+
+
+def test_v07_nested_immutability_frozen_dict_and_list() -> None:
+    """V-07: Nested metadata structures are deeply immutable and block in-place mutation."""
+    doc = BenchmarkDocument(
+        document_id="doc-v07",
+        title="عنوان سند",
+        text="متن سند",
+        sections=[DocumentSection(section_id="s1", heading="بخش ۱", text="متن بخش")],
+        metadata={
+            "tag": "history",
+            "tag_list": ["iran", "tehran"],
+            "nested": {"level": 1},
+        },
+    )
+
+    # In-place dictionary assignment blocked
+    with pytest.raises(TypeError, match="FrozenDict is immutable"):
+        doc.metadata["tag"] = "geography"
+
+    # In-place list mutation blocked
+    with pytest.raises(TypeError, match="FrozenList is immutable"):
+        doc.metadata["tag_list"].append("isfahan")
+
+    # In-place nested dictionary mutation blocked
+    with pytest.raises(TypeError, match="FrozenDict is immutable"):
+        doc.metadata["nested"]["level"] = 2
+
+    # In-place deletion blocked
+    with pytest.raises(TypeError, match="FrozenDict is immutable"):
+        del doc.metadata["tag"]
+
+    # Question metadata and query_metadata immutability
+    q = BenchmarkQuestion(
+        question_id="q-v07",
+        question="پرسش آزمایشی؟",
+        question_type=QuestionType.DIRECT_FACTUAL,
+        scope=QuestionScope.LOCAL,
+        gold_answer="پاسخ",
+        query_metadata={"param_list": [1, 2, 3]},
+        metadata={"eval_dict": {"score": 10}},
+    )
+
+    with pytest.raises(TypeError, match="FrozenList is immutable"):
+        q.query_metadata["param_list"].append(4)
+
+    with pytest.raises(TypeError, match="FrozenDict is immutable"):
+        q.metadata["eval_dict"]["score"] = 20
+
+
+# -------------------------------------------------------------------------
+# V-08: Guarantee Capability Validation Before Adapter Use
+# -------------------------------------------------------------------------
+
+
+def test_v08_adapter_activate_enforces_capabilities() -> None:
+    """V-08: activate() enforces capability validation before prepare() or indexing/querying."""
+
+    class BrokenAdapter(BaseRAGAdapter):
+        def __init__(self) -> None:
+            self.prepare_called = False
+
+        @property
+        def system_name(self) -> str:
+            return "broken_rag"
+
+        @property
+        def variant_name(self) -> str:
+            return "v1"
+
+        @property
+        def capabilities(self) -> AdapterCapabilities:
+            return AdapterCapabilities(
+                supports_update=True
+            )  # Declares update but doesn't override it
+
+        def prepare(self, config: BenchmarkConfig) -> None:
+            self.prepare_called = True
+
+        def index(self, documents: Sequence[BenchmarkDocument]) -> IndexingResult:
+            return IndexingResult()
+
+        def query(self, query_input: AdapterQueryInput) -> QueryResult:
+            return QueryResult.create_success(
+                question_id=query_input.question_id,
+                system=self.system_name,
+                answer="پاسخ",
+            )
+
+        def health(self) -> HealthCheckResult:
+            return HealthCheckResult(healthy=True, system=self.system_name)
+
+        def cleanup(self) -> None:
+            pass
+
+    adapter = BrokenAdapter()
+    config = BenchmarkConfig(system="broken_rag", variant="v1")
+
+    # activate() must fail BEFORE prepare() is executed
+    with pytest.raises(InvalidCapabilityDeclarationError, match="does not override the update"):
+        adapter.activate(config)
+
+    assert not adapter.prepare_called
+
+
+def test_v08_indexing_and_health_metadata_strict_json() -> None:
+    """V-08: IndexingResult.metadata and HealthCheckResult.details validate strict JSON."""
+    # Tuples rejected in IndexingResult
+    with pytest.raises(ValidationError, match="Strict JSON rejects tuple"):
+        IndexingResult(metadata={"invalid_tuple": (1, 2)})
+
+    # Non-finite floats rejected in HealthCheckResult
+    with pytest.raises(ValidationError, match="Strict JSON forbids non-finite float"):
+        HealthCheckResult(healthy=True, system="rag", details={"bad_val": float("inf")})
