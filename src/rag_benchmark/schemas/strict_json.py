@@ -32,6 +32,9 @@ class FrozenDict(dict[str, Any]):
     def setdefault(self, *args: Any, **kwargs: Any) -> Any:
         raise TypeError("FrozenDict is immutable; modification is not allowed.")
 
+    def __ior__(self, other: Any) -> Any:  # type: ignore[misc]
+        raise TypeError("FrozenDict is immutable; modification is not allowed.")
+
     def __copy__(self) -> FrozenDict:
         return self
 
@@ -73,6 +76,9 @@ class FrozenList(list[Any]):
         raise TypeError("FrozenList is immutable; modification is not allowed.")
 
     def __iadd__(self, other: Any) -> Any:  # type: ignore[misc]
+        raise TypeError("FrozenList is immutable; modification is not allowed.")
+
+    def __imul__(self, other: Any) -> Any:  # type: ignore[misc]
         raise TypeError("FrozenList is immutable; modification is not allowed.")
 
     def __copy__(self) -> FrozenList:
