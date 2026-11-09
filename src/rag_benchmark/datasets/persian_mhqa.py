@@ -49,9 +49,13 @@ class PersianMHQALoader(DatasetLoader):
 
     def load_questions(self) -> Iterable[BenchmarkQuestion]:
         raw = self._load_raw()
-        questions = raw.get("questions", [])
+        if "questions" not in raw:
+            raise ValueError(
+                f"PersianMHQA source at {self._path} is missing the required 'questions' collection"
+            )
+        questions = raw["questions"]
         if not isinstance(questions, list):
-            raise ValueError("PersianMHQA source 'questions' must be a list of objects")
+            raise ValueError(f"'questions' must be a list in PersianMHQA source at {self._path}")
         for idx, entry in enumerate(questions):
             if not isinstance(entry, dict):
                 raise ValueError(f"Malformed question record at index {idx} in PersianMHQA source")
@@ -90,6 +94,12 @@ class PersianMHQALoader(DatasetLoader):
                     f"supporting_documents must be a list in PersianMHQA source for "
                     f"question_id '{native_id}' at index {idx}"
                 )
+            for sd_idx, doc_id in enumerate(raw_supporting):
+                if not isinstance(doc_id, str) or not doc_id:
+                    raise ValueError(
+                        f"supporting_documents entry {sd_idx} must be a non-empty string in "
+                        f"PersianMHQA source for question_id '{native_id}' at index {idx}"
+                    )
             supporting = [deterministic_id("wiki-doc", doc_id) for doc_id in raw_supporting]
             yield BenchmarkQuestion(
                 question_id=qid,

@@ -82,19 +82,31 @@ class CustomWikiQuestionLoader(DatasetLoader):
                     f"'supporting_document_ids' must be a list for "
                     f"question_id '{qid_raw}' at line {line_no}"
                 )
+            for sd_idx, doc_id in enumerate(raw_support):
+                if not isinstance(doc_id, str) or not doc_id:
+                    raise ValueError(
+                        f"'supporting_document_ids' entry {sd_idx} must be a non-empty string "
+                        f"for question_id '{qid_raw}' at line {line_no}"
+                    )
             supporting = [
                 deterministic_id("wiki-doc", doc_id)
-                if not isinstance(doc_id, str) or not doc_id.startswith("wiki-doc-")
+                if not doc_id.startswith("wiki-doc-")
                 else doc_id
                 for doc_id in raw_support
             ]
+            hops_raw = obj.get("reasoning_hops", 1)
+            if isinstance(hops_raw, bool) or not isinstance(hops_raw, int):
+                raise ValueError(
+                    f"'reasoning_hops' must be an integer for question_id '{qid_raw}' "
+                    f"at line {line_no}"
+                )
             yield BenchmarkQuestion(
                 question_id=qid,
                 question=question_text,
                 question_type=QuestionType(obj.get("question_type", "direct_factual")),
                 difficulty=DifficultyLevel(obj.get("difficulty", "medium")),
                 scope=QuestionScope(obj.get("scope", "local")),
-                reasoning_hops=int(obj.get("reasoning_hops", 1)),
+                reasoning_hops=hops_raw,
                 gold_answer=obj.get("gold_answer", ""),
                 acceptable_answers=obj.get("acceptable_answers", []),
                 supporting_document_ids=supporting,

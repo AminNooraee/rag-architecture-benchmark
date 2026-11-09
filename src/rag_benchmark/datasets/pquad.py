@@ -52,11 +52,17 @@ class PQuADLoader(DatasetLoader):
             data = json.load(f)
         if not isinstance(data, dict):
             raise ValueError("PQuAD source file does not contain a JSON object")
+        if "data" not in data:
+            raise ValueError(
+                f"PQuAD source at {self._path} is missing the required 'data' collection"
+            )
+        if not isinstance(data["data"], list):
+            raise ValueError(f"'data' must be a list in PQuAD source at {self._path}")
         return data
 
     def load_documents(self) -> Iterable[BenchmarkDocument]:
         raw = self._load_raw()
-        for article in raw.get("data", []):
+        for article in raw["data"]:
             title = article.get("title", "")
             doc_id = deterministic_id("pquad-doc", title)
             sections: list[DocumentSection] = []
@@ -84,7 +90,7 @@ class PQuADLoader(DatasetLoader):
 
     def load_questions(self) -> Iterable[BenchmarkQuestion]:
         raw = self._load_raw()
-        for article in raw.get("data", []):
+        for article in raw["data"]:
             title = article.get("title", "")
             doc_id = deterministic_id("pquad-doc", title)
             for para_idx, para in enumerate(article.get("paragraphs", [])):

@@ -20,6 +20,7 @@ from rag_benchmark.datasets.builder import BenchmarkDatasetBuilder
 from rag_benchmark.datasets.config import load_config
 from rag_benchmark.datasets.custom_wiki_questions import CustomWikiQuestionLoader
 from rag_benchmark.datasets.io import write_json
+from rag_benchmark.datasets.persian_mhqa import PersianMHQALoader
 from rag_benchmark.datasets.pquad import PQuADLoader
 from rag_benchmark.datasets.wikipedia import WikipediaLoader
 from rag_benchmark.schemas.document import BenchmarkDocument, DocumentSection
@@ -252,6 +253,42 @@ def test_duplicate_yaml_keys_rejected(tmp_path: Path) -> None:
         load_config(p)
 
 
+def test_blank_dataset_name_rejected(tmp_path: Path) -> None:
+    cfg: dict[str, Any] = {
+        "dataset": {"name": "", "version": "v1"},
+        "output": {"directory": "out"},
+    }
+    with pytest.raises(ValidationError):
+        load_config(write_yaml(tmp_path, cfg))
+
+
+def test_whitespace_dataset_name_rejected(tmp_path: Path) -> None:
+    cfg: dict[str, Any] = {
+        "dataset": {"name": "   ", "version": "v1"},
+        "output": {"directory": "out"},
+    }
+    with pytest.raises(ValidationError):
+        load_config(write_yaml(tmp_path, cfg))
+
+
+def test_blank_dataset_version_rejected(tmp_path: Path) -> None:
+    cfg: dict[str, Any] = {
+        "dataset": {"name": "a", "version": ""},
+        "output": {"directory": "out"},
+    }
+    with pytest.raises(ValidationError):
+        load_config(write_yaml(tmp_path, cfg))
+
+
+def test_whitespace_dataset_version_rejected(tmp_path: Path) -> None:
+    cfg: dict[str, Any] = {
+        "dataset": {"name": "a", "version": "   "},
+        "output": {"directory": "out"},
+    }
+    with pytest.raises(ValidationError):
+        load_config(write_yaml(tmp_path, cfg))
+
+
 # ---------------------------------------------------------------------------
 # Finding 6: malformed source records fail with context
 # ---------------------------------------------------------------------------
@@ -266,6 +303,53 @@ def test_malformed_custom_wiki_question_missing_id(tmp_path: Path) -> None:
         list(loader.load_questions())
 
 
+def test_custom_wiki_object_supporting_document_rejected(tmp_path: Path) -> None:
+    record = json.dumps(
+        {
+            "question_id": "q1",
+            "question": "Sual?",
+            "supporting_document_ids": [{"id": "doc1"}],
+        }
+    )
+    p = tmp_path / "questions.jsonl"
+    p.write_text(record, encoding="utf-8")
+    loader = CustomWikiQuestionLoader(p)
+    with pytest.raises(ValueError, match="must be a non-empty string"):
+        list(loader.load_questions())
+
+
+def test_custom_wiki_string_reasoning_hops_rejected(tmp_path: Path) -> None:
+    record = json.dumps({"question_id": "q1", "question": "Sual?", "reasoning_hops": "2"})
+    p = tmp_path / "questions.jsonl"
+    p.write_text(record, encoding="utf-8")
+    loader = CustomWikiQuestionLoader(p)
+    with pytest.raises(ValueError, match="'reasoning_hops' must be an integer"):
+        list(loader.load_questions())
+
+
+def test_custom_wiki_malformed_reasoning_hops_reports_context(tmp_path: Path) -> None:
+    line1 = json.dumps({"question_id": "ok", "question": "Sual?", "reasoning_hops": 1})
+    line2 = json.dumps({"question_id": "bad-q", "question": "Sual?", "reasoning_hops": "abc"})
+    p = tmp_path / "questions.jsonl"
+    p.write_text(line1 + "\n" + line2 + "\n", encoding="utf-8")
+    loader = CustomWikiQuestionLoader(p)
+    with pytest.raises(ValueError) as exc_info:
+        list(loader.load_questions())
+    message = str(exc_info.value)
+    assert "bad-q" in message
+    assert "line 2" in message
+    assert "reasoning_hops" in message
+
+
+def test_custom_wiki_boolean_reasoning_hops_rejected(tmp_path: Path) -> None:
+    record = json.dumps({"question_id": "q1", "question": "Sual?", "reasoning_hops": True})
+    p = tmp_path / "questions.jsonl"
+    p.write_text(record, encoding="utf-8")
+    loader = CustomWikiQuestionLoader(p)
+    with pytest.raises(ValueError, match="'reasoning_hops' must be an integer"):
+        list(loader.load_questions())
+
+
 def test_malformed_pquad_missing_question_id(tmp_path: Path) -> None:
     pquad: dict[str, Any] = {
         "data": [{"title": "t", "paragraphs": [{"qas": [{"question": "q?"}]}]}]
@@ -274,6 +358,58 @@ def test_malformed_pquad_missing_question_id(tmp_path: Path) -> None:
     p.write_text(json.dumps(pquad), encoding="utf-8")
     loader = PQuADLoader(p)
     with pytest.raises(ValueError, match="Missing question id"):
+        list(loader.load_questions())
+
+
+def test_pquad_missing_data_rejected(tmp_path: Path) -> None:
+    p = tmp_path / "pquad.json"
+    p.write_text("{}", encoding="utf-8")
+    loader = PQuADLoader(p)
+    with pytest.raises(ValueError, match="missing the required 'data'"):
+        list(loader.load_questions())
+
+
+def test_pquad_non_list_data_rejected(tmp_path: Path) -> None:
+    p = tmp_path / "pquad.json"
+    p.write_text(json.dumps({"data": {}}), encoding="utf-8")
+    loader = PQuADLoader(p)
+    with pytest.raises(ValueError, match="'data' must be a list"):
+        list(loader.load_questions())
+
+
+def test_persian_mhqa_missing_questions_rejected(tmp_path: Path) -> None:
+    p = tmp_path / "mhqa.json"
+    p.write_text("{}", encoding="utf-8")
+    loader = PersianMHQALoader(p)
+    with pytest.raises(ValueError, match="missing the required 'questions'"):
+        list(loader.load_questions())
+
+
+def test_persian_mhqa_non_list_questions_rejected(tmp_path: Path) -> None:
+    p = tmp_path / "mhqa.json"
+    p.write_text(json.dumps({"questions": {}}), encoding="utf-8")
+    loader = PersianMHQALoader(p)
+    with pytest.raises(ValueError, match="'questions' must be a list"):
+        list(loader.load_questions())
+
+
+def test_persian_mhqa_object_supporting_document_rejected(tmp_path: Path) -> None:
+    data: dict[str, Any] = {
+        "questions": [
+            {
+                "question_id": "q1",
+                "question": "Sual?",
+                "type": "direct_factual",
+                "reasoning_hops": 1,
+                "answer": "a",
+                "supporting_documents": [{"id": "doc1"}],
+            }
+        ]
+    }
+    p = tmp_path / "mhqa.json"
+    p.write_text(json.dumps(data), encoding="utf-8")
+    loader = PersianMHQALoader(p)
+    with pytest.raises(ValueError, match="must be a non-empty string"):
         list(loader.load_questions())
 
 

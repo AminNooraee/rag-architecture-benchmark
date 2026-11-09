@@ -10,10 +10,12 @@ loader.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Self, cast
+from typing import Annotated, Any, Self, cast
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints, model_validator
+
+NonBlankString = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 
 
 def _unique_key_loader(stream: str) -> dict[str, Any]:
@@ -50,8 +52,8 @@ def _unique_key_loader(stream: str) -> dict[str, Any]:
 
 
 class DatasetIdentityConfig(BaseModel):
-    name: str = Field(..., description="Dataset name")
-    version: str = Field(..., description="Dataset version")
+    name: NonBlankString = Field(..., description="Dataset name")
+    version: NonBlankString = Field(..., description="Dataset version")
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
