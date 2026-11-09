@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import Any
 
 from rag_benchmark.datasets.builder import BenchmarkDatasetBuilder
 from rag_benchmark.datasets.config import RootConfig
@@ -15,8 +16,6 @@ from rag_benchmark.datasets.custom_wiki_questions import CustomWikiQuestionLoade
 from rag_benchmark.datasets.persian_mhqa import PersianMHQALoader
 from rag_benchmark.datasets.pquad import PQuADLoader
 from rag_benchmark.datasets.wikipedia import WikipediaLoader
-
-from typing import Any, TYPE_CHECKING
 
 
 def _load_config(path: Path) -> RootConfig:

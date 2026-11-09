@@ -92,12 +92,14 @@ class PQuADLoader(DatasetLoader):
                     qid = qa.get("id")
                     if not qid:
                         raise ValueError(
-                            f"Missing question id in PQuAD source at article '{title}' paragraph index {para_idx}"
+                            f"Missing question id in PQuAD source at article '{title}' "
+                            f"paragraph index {para_idx}"
                         )
                     question_text = qa.get("question", "")
                     if not question_text:
                         raise ValueError(
-                            f"Missing question text for question id '{qid}' in PQuAD source"
+                            f"Missing question text for question id '{qid}' "
+                            f"in PQuAD source"
                         )
                     is_impossible = qa.get("is_impossible", False)
                     # Determine question type

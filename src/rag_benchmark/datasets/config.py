@@ -9,10 +9,10 @@ rejected by the custom loader.
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator, validator
-from typing import Any
 
 
 def _unique_key_loader(stream: str) -> dict[str, Any]:
@@ -24,7 +24,11 @@ def _unique_key_loader(stream: str) -> dict[str, Any]:
     class UniqueKeyLoader(yaml.SafeLoader):
         pass
 
-    def construct_mapping(loader: yaml.Loader, node: yaml.MappingNode, deep: bool = False) -> dict[Any, Any]:
+    def construct_mapping(
+        loader: yaml.Loader,
+        node: yaml.MappingNode,
+        deep: bool = False,
+    ) -> dict[Any, Any]:
         mapping: dict[Any, Any] = {}
         for key_node, value_node in node.value:
             key = loader.construct_object(key_node, deep=deep)

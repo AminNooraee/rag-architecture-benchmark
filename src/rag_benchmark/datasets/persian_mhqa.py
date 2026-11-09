@@ -57,7 +57,8 @@ class PersianMHQALoader(DatasetLoader):
             question_text = entry.get("question", "")
             if not question_text:
                 raise ValueError(
-                    f"Missing question text in PersianMHQA source for question_id '{native_id}' at index {idx}"
+                    f"Missing question text in PersianMHQA source for "
+                    f"question_id '{native_id}' at index {idx}"
                 )
             src_type = entry.get("type", "")
             # Determine question type

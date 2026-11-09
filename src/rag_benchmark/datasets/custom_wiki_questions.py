@@ -60,14 +60,16 @@ class CustomWikiQuestionLoader(DatasetLoader):
             question_text = obj.get("question", "")
             if not question_text:
                 raise ValueError(
-                    f"Missing 'question' for question_id '{qid_raw}' in custom Wiki questions source at line {idx}"
+                    f"Missing 'question' for question_id '{qid_raw}' "
+                    f"in custom Wiki questions source at line {idx}"
                 )
             qid = deterministic_id("custom-q", qid_raw)
             # Validate supporting_document_ids type
             raw_support = obj.get("supporting_document_ids", [])
             if not isinstance(raw_support, list):
                 raise ValueError(
-                    f"'supporting_document_ids' must be a list for question_id '{qid_raw}' at line {idx}"
+                    f"'supporting_document_ids' must be a list for "
+                    f"question_id '{qid_raw}' at line {idx}"
                 )
             supporting = [
                 deterministic_id("wiki-doc", doc_id)
