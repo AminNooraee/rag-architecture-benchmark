@@ -87,12 +87,18 @@ class PQuADLoader(DatasetLoader):
         for article in raw.get("data", []):
             title = article.get("title", "")
             doc_id = deterministic_id("pquad-doc", title)
-            for para in article.get("paragraphs", []):
+            for para_idx, para in enumerate(article.get("paragraphs", [])):
                 for qa in para.get("qas", []):
                     qid = qa.get("id")
                     if not qid:
-                        continue
+                        raise ValueError(
+                            f"Missing question id in PQuAD source at article '{title}' paragraph index {para_idx}"
+                        )
                     question_text = qa.get("question", "")
+                    if not question_text:
+                        raise ValueError(
+                            f"Missing question text for question id '{qid}' in PQuAD source"
+                        )
                     is_impossible = qa.get("is_impossible", False)
                     # Determine question type
                     if is_impossible:

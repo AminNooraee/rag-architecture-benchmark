@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
-import json
 import os
 import tempfile
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
+
+from rag_benchmark.schemas.strict_json import strict_json_dumps
 
 
 def _atomic_write(path: Path, data: str) -> None:
@@ -23,13 +24,15 @@ def _atomic_write(path: Path, data: str) -> None:
 
 
 def write_json(path: str | Path, obj: Any) -> None:
-    json_str = json.dumps(obj, ensure_ascii=False, indent=2, sort_keys=True)
+    # Strict JSON serialization without NaN/Infinity, sorted keys for deterministic output
+    json_str = strict_json_dumps(obj, indent=2)
     _atomic_write(Path(path), json_str + "\n")
 
 
 def write_jsonl(path: str | Path, items: Iterable[Any]) -> None:
+    # Serialize each item with strict JSON and sorted keys
     lines = []
     for item in items:
         data = item.model_dump(mode="json") if hasattr(item, "model_dump") else item
-        lines.append(json.dumps(data, ensure_ascii=False, sort_keys=True))
+        lines.append(strict_json_dumps(data))
     _atomic_write(Path(path), "\n".join(lines) + "\n")

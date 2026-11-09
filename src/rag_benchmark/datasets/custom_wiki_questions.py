@@ -50,23 +50,34 @@ class CustomWikiQuestionLoader(DatasetLoader):
         return []
 
     def load_questions(self) -> Iterable[BenchmarkQuestion]:
-        for obj in self._iter_lines():
-            # Validate required fields minimally; Pydantic will enforce further
+        for idx, obj in enumerate(self._iter_lines()):
+            # Validate required fields; raise on malformed records
             qid_raw = obj.get("question_id")
             if not qid_raw:
-                continue
+                raise ValueError(
+                    f"Missing 'question_id' in custom Wiki questions source at line {idx}"
+                )
+            question_text = obj.get("question", "")
+            if not question_text:
+                raise ValueError(
+                    f"Missing 'question' for question_id '{qid_raw}' in custom Wiki questions source at line {idx}"
+                )
             qid = deterministic_id("custom-q", qid_raw)
-            # Map any supporting document placeholders to Wikipedia IDs if needed
+            # Validate supporting_document_ids type
             raw_support = obj.get("supporting_document_ids", [])
+            if not isinstance(raw_support, list):
+                raise ValueError(
+                    f"'supporting_document_ids' must be a list for question_id '{qid_raw}' at line {idx}"
+                )
             supporting = [
                 deterministic_id("wiki-doc", doc_id)
-                if not doc_id.startswith("wiki-doc-")
+                if not isinstance(doc_id, str) or not doc_id.startswith("wiki-doc-")
                 else doc_id
                 for doc_id in raw_support
             ]
             yield BenchmarkQuestion(
                 question_id=qid,
-                question=obj.get("question", ""),
+                question=question_text,
                 question_type=QuestionType(obj.get("question_type", "direct_factual")),
                 difficulty=DifficultyLevel(obj.get("difficulty", "medium")),
                 scope=QuestionScope(obj.get("scope", "local")),

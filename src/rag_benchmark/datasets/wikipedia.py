@@ -33,19 +33,36 @@ class WikipediaLoader(DatasetLoader):
 
     def _iter_lines(self) -> Iterable[dict[str, Any]]:
         with self._path.open("r", encoding="utf-8") as f:
-            for line in f:
+            for idx, line in enumerate(f, start=1):
                 line = line.strip()
                 if not line:
                     continue
-                yield json.loads(line)
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError as e:
+                    raise ValueError(
+                        f"Invalid JSON at line {idx} in {self._path}: {e.msg}"
+                    ) from None
+                if not isinstance(obj, dict):
+                    raise ValueError(
+                        f"JSON line {idx} in {self._path} does not contain an object mapping"
+                    )
+                yield obj
 
     def load_documents(self) -> Iterable[BenchmarkDocument]:
         for obj in self._iter_lines():
-            page_id = obj.get("page_id", "")
+            page_id = obj.get("page_id")
+            if not page_id:
+                raise ValueError(f"Missing 'page_id' in Wikipedia source record: {obj}")
             title = obj.get("title", "")
             doc_id = deterministic_id("wiki-doc", page_id)
             sections: list[DocumentSection] = []
-            for idx, sec in enumerate(obj.get("sections", [])):
+            raw_sections = obj.get("sections", [])
+            if not isinstance(raw_sections, list):
+                raise ValueError(
+                    f"'sections' must be a list in Wikipedia source record for page_id '{page_id}'"
+                )
+            for idx, sec in enumerate(raw_sections):
                 heading = sec.get("heading", "")
                 text = sec.get("text", "")
                 sec_id = deterministic_id("wiki-sec", doc_id, str(idx))

@@ -49,9 +49,16 @@ class PersianMHQALoader(DatasetLoader):
 
     def load_questions(self) -> Iterable[BenchmarkQuestion]:
         raw = self._load_raw()
-        for entry in raw.get("questions", []):
+        for idx, entry in enumerate(raw.get("questions", [])):
             native_id = entry.get("question_id")
+            if not native_id:
+                raise ValueError(f"Missing question_id in PersianMHQA source at index {idx}")
             qid = deterministic_id("pmhqa-q", native_id)
+            question_text = entry.get("question", "")
+            if not question_text:
+                raise ValueError(
+                    f"Missing question text in PersianMHQA source for question_id '{native_id}' at index {idx}"
+                )
             src_type = entry.get("type", "")
             # Determine question type
             if src_type == "multi_hop":
@@ -61,10 +68,15 @@ class PersianMHQALoader(DatasetLoader):
             hops = int(entry.get("reasoning_hops", 1))
             # Map supporting document placeholders to deterministic Wikipedia IDs
             raw_supporting = entry.get("supporting_documents", [])
+            if not isinstance(raw_supporting, list):
+                raise ValueError(
+                    f"supporting_documents must be a list in PersianMHQA source for "
+                    f"question_id '{native_id}' at index {idx}"
+                )
             supporting = [deterministic_id("wiki-doc", doc_id) for doc_id in raw_supporting]
             yield BenchmarkQuestion(
                 question_id=qid,
-                question=entry.get("question", ""),
+                question=question_text,
                 question_type=qtype,
                 difficulty=DifficultyLevel.MEDIUM,
                 scope=QuestionScope.MULTI_DOCUMENT,
