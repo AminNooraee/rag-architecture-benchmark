@@ -13,6 +13,7 @@ from typing import Any
 
 from rag_benchmark.datasets.base import DatasetLoader
 from rag_benchmark.datasets.ids import deterministic_id
+from rag_benchmark.schemas.document import BenchmarkDocument
 from rag_benchmark.schemas.question import (
     BenchmarkQuestion,
     DifficultyLevel,
@@ -38,9 +39,12 @@ class PersianMHQALoader(DatasetLoader):
 
     def _load_raw(self) -> dict[str, Any]:
         with self._path.open("r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("PersianMHQA source file does not contain a JSON object")
+        return data
 
-    def load_documents(self) -> Iterable:  # type: ignore[override]
+    def load_documents(self) -> Iterable[BenchmarkDocument]:
         return []
 
     def load_questions(self) -> Iterable[BenchmarkQuestion]:

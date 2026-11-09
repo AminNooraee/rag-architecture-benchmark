@@ -49,7 +49,10 @@ class PQuADLoader(DatasetLoader):
 
     def _load_raw(self) -> dict[str, Any]:
         with self._path.open("r", encoding="utf-8") as f:
-            return json.load(f)
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("PQuAD source file does not contain a JSON object")
+        return data
 
     def load_documents(self) -> Iterable[BenchmarkDocument]:
         raw = self._load_raw()

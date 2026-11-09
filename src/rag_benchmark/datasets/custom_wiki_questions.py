@@ -14,6 +14,7 @@ from typing import Any
 
 from rag_benchmark.datasets.base import DatasetLoader
 from rag_benchmark.datasets.ids import deterministic_id
+from rag_benchmark.schemas.document import BenchmarkDocument
 from rag_benchmark.schemas.question import (
     BenchmarkQuestion,
     DifficultyLevel,
@@ -45,7 +46,7 @@ class CustomWikiQuestionLoader(DatasetLoader):
                     continue
                 yield json.loads(line)
 
-    def load_documents(self) -> Iterable:  # type: ignore[override]
+    def load_documents(self) -> Iterable[BenchmarkDocument]:
         return []
 
     def load_questions(self) -> Iterable[BenchmarkQuestion]:

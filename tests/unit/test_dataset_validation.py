@@ -1,10 +1,12 @@
 """Builder validation tests."""
 
-import pytest
+from collections.abc import Iterable
 from pathlib import Path
 
-from rag_benchmark.datasets.builder import BenchmarkDatasetBuilder
+import pytest
+
 from rag_benchmark.datasets.base import DatasetLoader
+from rag_benchmark.datasets.builder import BenchmarkDatasetBuilder
 from rag_benchmark.schemas.document import BenchmarkDocument, DocumentSection
 from rag_benchmark.schemas.question import (
     BenchmarkQuestion,
@@ -15,7 +17,13 @@ from rag_benchmark.schemas.question import (
 
 
 class DummyLoader(DatasetLoader):
-    def __init__(self, docs, questions, name: str = "dummy", version: str = "") -> None:
+    def __init__(
+        self,
+        docs: Iterable[BenchmarkDocument],
+        questions: Iterable[BenchmarkQuestion],
+        name: str = "dummy",
+        version: str = "",
+    ) -> None:
         self._docs = docs
         self._qs = questions
         self._name = name
@@ -29,10 +37,10 @@ class DummyLoader(DatasetLoader):
     def source_version(self) -> str:
         return self._ver
 
-    def load_documents(self):
+    def load_documents(self) -> Iterable[BenchmarkDocument]:
         return self._docs
 
-    def load_questions(self):
+    def load_questions(self) -> Iterable[BenchmarkQuestion]:
         return self._qs
 
 
@@ -49,7 +57,7 @@ def make_doc(doc_id: str) -> BenchmarkDocument:
     )
 
 
-def make_q(q_id: str, doc_ids) -> BenchmarkQuestion:
+def make_q(q_id: str, doc_ids: list[str]) -> BenchmarkQuestion:
     return BenchmarkQuestion(
         question_id=q_id,
         question="q?",

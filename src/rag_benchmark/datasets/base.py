@@ -17,11 +17,11 @@ from rag_benchmark.schemas.question import BenchmarkQuestion
 
 class DatasetLoader(abc.ABC):
     """Base class for all dataset source adapters.
-+
-+    Concrete subclasses expose a *source_name* and *source_version* attribute
-+    (both strings) and implement two generator methods returning the canonical
-+    models defined in :pymod:`rag_benchmark.schemas`.
-+    """
+    +
+    +    Concrete subclasses expose a *source_name* and *source_version* attribute
+    +    (both strings) and implement two generator methods returning the canonical
+    +    models defined in :pymod:`rag_benchmark.schemas`.
+    +"""
 
     @property
     @abc.abstractmethod
@@ -36,14 +36,14 @@ class DatasetLoader(abc.ABC):
     @abc.abstractmethod
     def load_documents(self) -> Iterable[BenchmarkDocument]:  # pragma: no cover
         """Yield :class:`BenchmarkDocument` objects for the source.
-+
-+        Implementations should be deterministic – the same underlying raw file
-+        must always produce the same sequence of documents with stable IDs.
-+        """
+        +
+        +        Implementations should be deterministic – the same underlying raw file
+        +        must always produce the same sequence of documents with stable IDs.
+        +"""
 
     @abc.abstractmethod
     def load_questions(self) -> Iterable[BenchmarkQuestion]:  # pragma: no cover
         """Yield :class:`BenchmarkQuestion` objects for the source.
-+
-+        The same deterministic guarantees as :meth:`load_documents` apply.
-+        """
+        +
+        +        The same deterministic guarantees as :meth:`load_documents` apply.
+        +"""

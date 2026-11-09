@@ -1,5 +1,4 @@
-"""Deterministic statistics for a built dataset.
-"""
+"""Deterministic statistics for a built dataset."""
 
 from __future__ import annotations
 

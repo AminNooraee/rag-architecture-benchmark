@@ -6,22 +6,25 @@ Only the ``build`` sub‑command is required for the test suite.
 from __future__ import annotations
 
 import argparse
-from pathlib import Path
 import sys
+from pathlib import Path
 from typing import Any
 
 import yaml
 
 from rag_benchmark.datasets.builder import BenchmarkDatasetBuilder
+from rag_benchmark.datasets.custom_wiki_questions import CustomWikiQuestionLoader
 from rag_benchmark.datasets.persian_mhqa import PersianMHQALoader
 from rag_benchmark.datasets.pquad import PQuADLoader
 from rag_benchmark.datasets.wikipedia import WikipediaLoader
-from rag_benchmark.datasets.custom_wiki_questions import CustomWikiQuestionLoader
 
 
 def _load_config(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        data = yaml.safe_load(f)
+    if not isinstance(data, dict):
+        raise ValueError("Configuration file must contain a mapping")
+    return data
 
 
 def build_from_config(cfg: dict[str, Any]) -> None:

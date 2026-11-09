@@ -1,5 +1,4 @@
-"""Simple atomic JSON/JSONL writers used by the dataset builder.
-"""
+"""Simple atomic JSON/JSONL writers used by the dataset builder."""
 
 from __future__ import annotations
 

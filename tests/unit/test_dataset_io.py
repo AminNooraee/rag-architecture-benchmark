@@ -1,7 +1,7 @@
 """Tests for dataset I/O utilities."""
 
-from pathlib import Path
 import json
+from pathlib import Path
 
 from rag_benchmark.datasets.io import write_json, write_jsonl
 

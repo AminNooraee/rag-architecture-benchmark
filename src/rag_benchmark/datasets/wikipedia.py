@@ -13,6 +13,7 @@ from typing import Any
 from rag_benchmark.datasets.base import DatasetLoader
 from rag_benchmark.datasets.ids import deterministic_id
 from rag_benchmark.schemas.document import BenchmarkDocument, DocumentSection
+from rag_benchmark.schemas.question import BenchmarkQuestion
 
 
 class WikipediaLoader(DatasetLoader):
