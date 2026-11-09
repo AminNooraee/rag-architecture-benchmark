@@ -38,3 +38,4 @@ htmlcov/
 /runs/
 !/runs/.gitkeep
 .pytest_tmp2/
+.pytest_tmp*/
