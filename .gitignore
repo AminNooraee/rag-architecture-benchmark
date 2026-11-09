@@ -37,3 +37,4 @@ htmlcov/
 # Output run artifacts from benchmarks
 /runs/
 !/runs/.gitkeep
+.pytest_tmp2/
