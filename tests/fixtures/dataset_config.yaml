@@ -1,0 +1,23 @@
+dataset:
+  name: persian-benchmark
+  version: v1
+
+sources:
+  pquad:
+    enabled: true
+    path: tests/fixtures/datasets/pquad/sample.json
+    version: "2023"
+
+  persian_mhqa:
+    enabled: true
+    path: tests/fixtures/datasets/persian_mhqa/sample.json
+    version: "2023"
+
+  wikipedia:
+    enabled: true
+    path: tests/fixtures/datasets/wikipedia/articles.jsonl
+    version: "2023"
+
+
+output:
+  directory: {tmp_output}

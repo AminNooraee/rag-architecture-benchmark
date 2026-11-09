@@ -1,0 +1,28 @@
+{
+  "data": [
+    {
+      "title": "مثال مقاله",
+      "paragraphs": [
+        {
+          "context": "متن پاراگراف به زبان فارسی.",
+          "qas": [
+            {
+              "id": "q1",
+              "question": "این یک سؤال تستی است؟",
+              "answers": [
+                {"text": "بله", "answer_start": 0}
+              ],
+              "is_impossible": false
+            },
+            {
+              "id": "q2",
+              "question": "یک سؤال بدون جواب؟",
+              "answers": [],
+              "is_impossible": true
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}
