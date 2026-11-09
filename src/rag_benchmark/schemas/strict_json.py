@@ -172,11 +172,12 @@ def validate_strict_json_dict(d: Any, field_name: str = "metadata") -> dict[str,
     return validated
 
 
-def strict_json_dumps(obj: Any, indent: int | None = None) -> str:
+def strict_json_dumps(obj: Any, indent: int | None = None, sort_keys: bool = False) -> str:
     """Serialize object to JSON enforcing strict JSON standards (no NaN/Inf, UTF-8 unescaped)."""
     return json.dumps(
         obj,
         ensure_ascii=False,
         indent=indent,
+        sort_keys=sort_keys,
         allow_nan=False,
     )

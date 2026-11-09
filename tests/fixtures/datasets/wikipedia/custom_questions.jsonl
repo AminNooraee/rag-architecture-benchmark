@@ -1,0 +1,1 @@
+{"question_id": "wiki-custom-001", "question": "What is the title of the article?", "question_type": "global_summary", "difficulty": "medium", "scope": "global", "reasoning_hops": 1, "gold_answer": "صفحه تست", "acceptable_answers": [], "supporting_document_ids": ["doc1"], "supporting_evidence": [], "answerable": true, "metadata": {}}

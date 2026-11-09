@@ -1,0 +1,12 @@
+{
+  "questions": [
+    {
+      "question_id": "mhq1",
+      "question": "چگونه می‌توان بقیه مقاله را پیدا کرد؟",
+      "answer": "با استفاده از لینک‌های داخلی.",
+      "supporting_documents": ["doc1", "doc2"],
+      "reasoning_hops": 2,
+      "type": "multi_hop"
+    }
+  ]
+}
