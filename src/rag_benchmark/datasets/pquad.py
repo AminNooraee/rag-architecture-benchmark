@@ -98,8 +98,7 @@ class PQuADLoader(DatasetLoader):
                     question_text = qa.get("question", "")
                     if not question_text:
                         raise ValueError(
-                            f"Missing question text for question id '{qid}' "
-                            f"in PQuAD source"
+                            f"Missing question text for question id '{qid}' in PQuAD source"
                         )
                     is_impossible = qa.get("is_impossible", False)
                     # Determine question type
