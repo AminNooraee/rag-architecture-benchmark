@@ -8,20 +8,23 @@ and returns a manifest.
 from __future__ import annotations
 
 import hashlib
-import json
 from pathlib import Path
-from typing import Any
 
 from rag_benchmark.datasets.base import DatasetLoader
-from rag_benchmark.datasets.io import write_json
+from rag_benchmark.datasets.io import _atomic_write, write_json
 from rag_benchmark.datasets.manifest import BenchmarkDatasetManifest, SourceInfo
 from rag_benchmark.datasets.statistics import DatasetStatistics
 from rag_benchmark.schemas.document import BenchmarkDocument
 from rag_benchmark.schemas.question import BenchmarkQuestion
+from rag_benchmark.schemas.strict_json import strict_json_dumps
+
+
+def _serialize_record(item: BenchmarkDocument | BenchmarkQuestion) -> str:
+    return strict_json_dumps(item.model_dump(mode="json"), sort_keys=True)
 
 
 class BenchmarkDatasetBuilder:
-    def __init__(self, dataset_name: str | None = None, dataset_version: str | None = None) -> None:
+    def __init__(self, dataset_name: str, dataset_version: str) -> None:
         self._loaders: list[DatasetLoader] = []
         self._dataset_name = dataset_name
         self._dataset_version = dataset_version
@@ -121,17 +124,8 @@ class BenchmarkDatasetBuilder:
             )
 
         # Serialize documents and questions deterministically for checksum and persistence
-        def _serialize(item: Any) -> str:
-            # Use strict JSON settings and sorted keys
-            return json.dumps(
-                item.model_dump(mode="json"),
-                ensure_ascii=False,
-                sort_keys=True,
-                allow_nan=False,
-            )
-
-        doc_lines = [_serialize(d) for d in docs.values()]
-        ques_lines = [_serialize(q) for q in qs.values()]
+        doc_lines = [_serialize_record(d) for d in docs.values()]
+        ques_lines = [_serialize_record(q) for q in qs.values()]
 
         # Compute content checksum over sorted lines
         content_hasher = hashlib.sha256()
@@ -142,14 +136,12 @@ class BenchmarkDatasetBuilder:
         content_checksum = content_hasher.hexdigest()
 
         # Write artifacts using deterministic order
-        from rag_benchmark.datasets.io import _atomic_write
-
         _atomic_write(out_path / "documents.jsonl", "\n".join(sorted(doc_lines)) + "\n")
         _atomic_write(out_path / "questions.jsonl", "\n".join(sorted(ques_lines)) + "\n")
 
         manifest = BenchmarkDatasetManifest(
-            dataset_name=self._dataset_name or out_path.name,
-            dataset_version=self._dataset_version or "v1",
+            dataset_name=self._dataset_name,
+            dataset_version=self._dataset_version,
             created_at=stats.created_at,
             builder_version="phase3b",
             sources=sources,

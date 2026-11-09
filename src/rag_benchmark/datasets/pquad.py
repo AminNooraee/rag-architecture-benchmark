@@ -107,6 +107,17 @@ class PQuADLoader(DatasetLoader):
                     else:
                         qtype = QuestionType.DIRECT_FACTUAL
                     answers = qa.get("answers", [])
+                    if not isinstance(answers, list):
+                        raise ValueError(
+                            f"'answers' must be a list for question id '{qid}' in PQuAD source "
+                            f"at article '{title}' paragraph index {para_idx}"
+                        )
+                    for ans in answers:
+                        if not isinstance(ans, dict) or "text" not in ans:
+                            raise ValueError(
+                                f"Malformed answer entry for question id '{qid}' in PQuAD source "
+                                f"at article '{title}' paragraph index {para_idx}"
+                            )
                     gold = answers[0]["text"] if answers else ""
                     accept = [a["text"] for a in answers[1:]] if len(answers) > 1 else []
                     qid_canonical = deterministic_id("pquad-q", qid)

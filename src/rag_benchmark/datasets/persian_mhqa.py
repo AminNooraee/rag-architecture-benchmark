@@ -49,7 +49,12 @@ class PersianMHQALoader(DatasetLoader):
 
     def load_questions(self) -> Iterable[BenchmarkQuestion]:
         raw = self._load_raw()
-        for idx, entry in enumerate(raw.get("questions", [])):
+        questions = raw.get("questions", [])
+        if not isinstance(questions, list):
+            raise ValueError("PersianMHQA source 'questions' must be a list of objects")
+        for idx, entry in enumerate(questions):
+            if not isinstance(entry, dict):
+                raise ValueError(f"Malformed question record at index {idx} in PersianMHQA source")
             native_id = entry.get("question_id")
             if not native_id:
                 raise ValueError(f"Missing question_id in PersianMHQA source at index {idx}")
@@ -66,7 +71,18 @@ class PersianMHQALoader(DatasetLoader):
                 qtype = QuestionType.MULTI_HOP
             else:
                 qtype = QuestionType.DIRECT_FACTUAL
-            hops = int(entry.get("reasoning_hops", 1))
+            hops_raw = entry.get("reasoning_hops", 1)
+            if isinstance(hops_raw, bool) or not isinstance(hops_raw, int):
+                raise ValueError(
+                    f"'reasoning_hops' must be an integer in PersianMHQA source for "
+                    f"question_id '{native_id}' at index {idx}"
+                )
+            if hops_raw < 1:
+                raise ValueError(
+                    f"'reasoning_hops' must be at least 1 in PersianMHQA source for "
+                    f"question_id '{native_id}' at index {idx}"
+                )
+            hops = hops_raw
             # Map supporting document placeholders to deterministic Wikipedia IDs
             raw_supporting = entry.get("supporting_documents", [])
             if not isinstance(raw_supporting, list):

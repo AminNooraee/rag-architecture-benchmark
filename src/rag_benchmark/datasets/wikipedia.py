@@ -63,6 +63,11 @@ class WikipediaLoader(DatasetLoader):
                     f"'sections' must be a list in Wikipedia source record for page_id '{page_id}'"
                 )
             for idx, sec in enumerate(raw_sections):
+                if not isinstance(sec, dict):
+                    raise ValueError(
+                        f"'sections' entries must be objects in Wikipedia source record for "
+                        f"page_id '{page_id}' at section index {idx}"
+                    )
                 heading = sec.get("heading", "")
                 text = sec.get("text", "")
                 sec_id = deterministic_id("wiki-sec", doc_id, str(idx))

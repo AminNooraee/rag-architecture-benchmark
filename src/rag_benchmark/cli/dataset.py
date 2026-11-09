@@ -27,7 +27,7 @@ def _load_config(path: Path) -> RootConfig:
 
 def build_from_config(cfg: RootConfig | dict[str, Any]) -> None:
     if not isinstance(cfg, RootConfig):
-        cfg = RootConfig.parse_obj(cfg)
+        cfg = RootConfig.model_validate(cfg)
     # Use typed configuration to drive builder construction
     output_dir = cfg.output.directory
     builder = BenchmarkDatasetBuilder(

@@ -38,30 +38,41 @@ class CustomWikiQuestionLoader(DatasetLoader):
     def source_version(self) -> str:
         return self._source_version
 
-    def _iter_lines(self) -> Iterable[dict[str, Any]]:
+    def _iter_lines(self) -> Iterable[tuple[int, dict[str, Any]]]:
         with self._path.open("r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
+            for line_no, raw_line in enumerate(f, start=1):
+                line = raw_line.strip()
                 if not line:
                     continue
-                yield json.loads(line)
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError as e:
+                    raise ValueError(
+                        f"Invalid JSON at line {line_no} in {self._path}: {e.msg}"
+                    ) from None
+                if not isinstance(obj, dict):
+                    raise ValueError(
+                        f"JSON record at line {line_no} in {self._path} "
+                        "does not contain an object mapping"
+                    )
+                yield line_no, obj
 
     def load_documents(self) -> Iterable[BenchmarkDocument]:
         return []
 
     def load_questions(self) -> Iterable[BenchmarkQuestion]:
-        for idx, obj in enumerate(self._iter_lines()):
+        for line_no, obj in self._iter_lines():
             # Validate required fields; raise on malformed records
             qid_raw = obj.get("question_id")
             if not qid_raw:
                 raise ValueError(
-                    f"Missing 'question_id' in custom Wiki questions source at line {idx}"
+                    f"Missing 'question_id' in custom Wiki questions source at line {line_no}"
                 )
             question_text = obj.get("question", "")
             if not question_text:
                 raise ValueError(
                     f"Missing 'question' for question_id '{qid_raw}' "
-                    f"in custom Wiki questions source at line {idx}"
+                    f"in custom Wiki questions source at line {line_no}"
                 )
             qid = deterministic_id("custom-q", qid_raw)
             # Validate supporting_document_ids type
@@ -69,7 +80,7 @@ class CustomWikiQuestionLoader(DatasetLoader):
             if not isinstance(raw_support, list):
                 raise ValueError(
                     f"'supporting_document_ids' must be a list for "
-                    f"question_id '{qid_raw}' at line {idx}"
+                    f"question_id '{qid_raw}' at line {line_no}"
                 )
             supporting = [
                 deterministic_id("wiki-doc", doc_id)

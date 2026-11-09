@@ -1,22 +1,23 @@
-"""Typed configuration models for Phase 3B dataset building.
+"""Typed configuration models for Phase 3B dataset building.
 
 These models enforce strict validation of the YAML configuration used by the
 CLI. They reject unknown keys, require mandatory fields, and ensure that
-`enabled` flags are real booleans. Duplicate keys in the YAML file are also
-rejected by the custom loader.
+``enabled`` flags are real booleans (the strings ``"true"``/``"false"`` are
+rejected). Duplicate keys in the YAML file are also rejected by the custom
+loader.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Self, cast
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator, validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
 
 def _unique_key_loader(stream: str) -> dict[str, Any]:
-    """Load YAML with duplicate‑key detection.
+    """Load YAML with duplicate-key detection.
 
     Raises ``yaml.YAMLError`` when a duplicate mapping key is encountered.
     """
@@ -42,7 +43,10 @@ def _unique_key_loader(stream: str) -> dict[str, Any]:
         yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
         construct_mapping,
     )
-    return yaml.load(stream, Loader=UniqueKeyLoader) or {}  # type: dict[str, Any]
+    data: Any = yaml.load(stream, Loader=UniqueKeyLoader)
+    if data is None:
+        return {}
+    return cast("dict[str, Any]", data)
 
 
 class DatasetIdentityConfig(BaseModel):
@@ -55,25 +59,21 @@ class DatasetIdentityConfig(BaseModel):
 class OutputConfig(BaseModel):
     directory: Path = Field(..., description="Output directory for the generated dataset")
 
-    @validator("directory", pre=True)
-    def _ensure_path(cls, v: str | Path) -> Path:
-        return Path(v)
-
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
 class BaseSourceConfig(BaseModel):
-    enabled: bool = Field(False, description="Whether this source should be included")
-    path: Path | None = None
-    version: str = ""
-
-    @validator("path", pre=True, always=True)
-    def _require_path_if_enabled(cls, v: str | Path | None, values: dict[str, Any]) -> Path | None:
-        if values.get("enabled") and not v:
-            raise ValueError("'path' must be provided when source is enabled")
-        return Path(v) if v is not None else None
+    enabled: StrictBool = Field(False, description="Whether this source should be included")
+    path: Path | None = Field(None, description="Path to the raw source data")
+    version: str = Field("", description="Upstream source version")
 
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+    @model_validator(mode="after")
+    def _require_path_when_enabled(self) -> Self:
+        if self.enabled and self.path is None:
+            raise ValueError("'path' must be provided when a source is enabled")
+        return self
 
 
 class PQuADSourceConfig(BaseSourceConfig):
@@ -108,20 +108,13 @@ class RootConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    @model_validator(mode="before")
-    @classmethod
-    def _ensure_mapping(cls, values: Any) -> dict[str, Any]:
-        if not isinstance(values, dict):
-            raise ValueError("Configuration root must be a mapping")
-        return values
-
 
 def load_config(path: Path) -> RootConfig:
     """Load and validate a YAML configuration file.
 
-    The function performs duplicate‑key detection and then parses the content
-    into :class:`RootConfig`. Validation errors are raised as ``ValidationError``
-    instances.
+    The function performs duplicate-key detection and then parses the content
+    into :class:`RootConfig`. Validation errors are raised as
+    ``ValidationError`` instances.
     """
     raw_text = path.read_text(encoding="utf-8")
     data = _unique_key_loader(raw_text)

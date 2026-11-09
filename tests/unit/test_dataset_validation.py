@@ -80,7 +80,7 @@ def test_duplicate_document_detection(tmp_path: Path) -> None:
     d1 = make_doc("doc1")
     d2 = make_doc("doc1")  # duplicate ID
     loader = DummyLoader([d1, d2], [])
-    builder = BenchmarkDatasetBuilder()
+    builder = BenchmarkDatasetBuilder("validation-dataset", "v1")
     builder.add_source(loader)
     with pytest.raises(ValueError, match="Duplicate document ID"):
         builder.build(tmp_path)
@@ -90,7 +90,7 @@ def test_missing_supporting_document(tmp_path: Path) -> None:
     d = make_doc("doc1")
     q = make_q("q1", ["nonexistent"])
     loader = DummyLoader([d], [q])
-    builder = BenchmarkDatasetBuilder()
+    builder = BenchmarkDatasetBuilder("validation-dataset", "v1")
     builder.add_source(loader)
     with pytest.raises(ValueError, match="Dangling supporting document references"):
         builder.build(tmp_path)
