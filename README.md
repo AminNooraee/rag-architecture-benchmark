@@ -1,6 +1,7 @@
 # Persian RAG Architecture Benchmark
 
 > **Phase 3A — Benchmark Harness Foundation (Remediated)**
+> **Phase 3C — Traditional Vector RAG Baseline (Implemented)**
 
 A rigorous, production-oriented evaluation harness for comparing Retrieval-Augmented Generation (RAG) architectures on Persian-language corpora.
 
@@ -16,7 +17,7 @@ Evaluating RAG systems in the Persian language presents unique structural and li
 The goal of this benchmark harness is to provide a unified, reproducible, and strictly fair foundation for assessing retrieval and generation quality across all candidate RAG architectures.
 
 Later phases will benchmark the following architectures against this harness:
-- **Traditional Vector RAG** (Dense chunking and cosine/HNSW vector search)
+- **Traditional Vector RAG** (Implemented in Phase 3C: deterministic chunking + exact in-memory cosine search)
 - **LightRAG** (Dual-level knowledge graph with low overhead)
 - **Neo4j GraphRAG** (Explicit property graph with Cypher queries)
 - **Microsoft GraphRAG** (Hierarchical community report generation)
@@ -117,7 +118,22 @@ Adapters declare supported features via `AdapterCapabilities` (`supports_increme
 
 ---
 
-## 4. Run Artifact Layout & Single-Writer Model
+## 4. Traditional Vector RAG Baseline (Phase 3C)
+
+The first candidate architecture is implemented: system `traditional_rag`, variant `dense_exact` (`src/rag_benchmark/adapters/traditional/`).
+
+- **Pipeline**: `BenchmarkDocument` → deterministic character-window chunking → batched embedding → exact in-memory cosine index → query embedding → cosine top-k → top-k `RetrievedEvidence` → LLM generation → canonical `QueryResult`.
+- **Deterministic Persian-safe chunking**: fixed character windows with optional overlap, word-boundary backtracking for space-separated scripts, and no destructive normalization; Persian Unicode and ZWNJ (`\u200c`) are preserved. Chunking knobs (`chunk_size`, `overlap`) live in `TraditionalRAGConfig`, carried under `BenchmarkConfig.extra["traditional_rag"]`.
+- **Exact cosine index**: `ExactCosineIndex` is a pure-stdlib in-memory index with finite-vector validation, deterministic `chunk_id` tie-breaking, and optional `top_k` / `score_threshold`. No vector database and no new dependencies.
+- **Provider abstractions**: nominal `EmbeddingProvider` / `LLMProvider` protocols; OpenAI-compatible HTTP implementations (standard library `urllib`) with API keys resolved only from environment variables; deterministic offline fakes power the full test suite.
+- **Fairness contract**: no reranking, HyDE, query rewriting, multi-query expansion, or hidden retrieval stages; `query()` receives only `AdapterQueryInput`, and gold answers/evidence are provably withheld (dedicated regression tests).
+- **Truthful accounting**: real `QueryUsage` and `QueryTiming` per query; staged failures (`retrieval_error` / `generation_error`) with retrieval evidence and timing preserved when generation fails.
+
+Remaining candidate architectures (LightRAG, Neo4j GraphRAG, Microsoft GraphRAG, RAPTOR, Hierarchical RAG) are planned for later phases.
+
+---
+
+## 5. Run Artifact Layout & Single-Writer Model
 
 Each benchmark execution outputs artifacts into an isolated, safe run directory:
 
@@ -170,7 +186,7 @@ A centralized sanitization layer (`rag_benchmark.security.sanitizer`) protects c
 
 ---
 
-## 5. Development & Quality Gates
+## 6. Development & Quality Gates
 
 The harness relies on a modern toolchain:
 - **Python**: `>=3.11` (tested with Python 3.13)

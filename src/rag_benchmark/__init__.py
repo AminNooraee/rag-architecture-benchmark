@@ -6,6 +6,7 @@ from rag_benchmark.adapters.base import (
     HealthCheckResult,
     IndexingResult,
 )
+from rag_benchmark.adapters.traditional import TraditionalRAGConfig, TraditionalVectorRAGAdapter
 from rag_benchmark.config.loader import load_config
 from rag_benchmark.config.models import BenchmarkConfig
 from rag_benchmark.errors.models import (
@@ -100,6 +101,8 @@ __all__ = [
     "RunStatus",
     "RuntimeMetadata",
     "StructuredError",
+    "TraditionalRAGConfig",
+    "TraditionalVectorRAGAdapter",
     "UnsupportedOperationError",
     "WriterConcurrencyError",
     "WriterMode",
