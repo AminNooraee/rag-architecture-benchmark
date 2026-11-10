@@ -6,6 +6,7 @@ from rag_benchmark.adapters.base import (
     HealthCheckResult,
     IndexingResult,
 )
+from rag_benchmark.adapters.lightrag import LightRAGAdapter, LightRAGConfig
 from rag_benchmark.adapters.traditional import TraditionalRAGConfig, TraditionalVectorRAGAdapter
 
 __all__ = [
@@ -13,6 +14,8 @@ __all__ = [
     "BaseRAGAdapter",
     "HealthCheckResult",
     "IndexingResult",
+    "LightRAGAdapter",
+    "LightRAGConfig",
     "TraditionalRAGConfig",
     "TraditionalVectorRAGAdapter",
 ]

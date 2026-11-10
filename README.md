@@ -2,6 +2,7 @@
 
 > **Phase 3A — Benchmark Harness Foundation (Remediated)**
 > **Phase 3C — Traditional Vector RAG Baseline (Implemented)**
+> **Phase 3D — LightRAG Baseline (Implemented)**
 
 A rigorous, production-oriented evaluation harness for comparing Retrieval-Augmented Generation (RAG) architectures on Persian-language corpora.
 
@@ -18,7 +19,7 @@ The goal of this benchmark harness is to provide a unified, reproducible, and st
 
 Later phases will benchmark the following architectures against this harness:
 - **Traditional Vector RAG** (Implemented in Phase 3C: deterministic chunking + exact in-memory cosine search)
-- **LightRAG** (Dual-level knowledge graph with low overhead)
+- **LightRAG** (Implemented in Phase 3D: official HKUDS dual-level knowledge graph integration)
 - **Neo4j GraphRAG** (Explicit property graph with Cypher queries)
 - **Microsoft GraphRAG** (Hierarchical community report generation)
 - **RAPTOR** (Recursive Abstractive Processing for Tree-Organized Retrieval)
@@ -129,11 +130,25 @@ The first candidate architecture is implemented: system `traditional_rag`, varia
 - **Fairness contract**: no reranking, HyDE, query rewriting, multi-query expansion, or hidden retrieval stages; `query()` receives only `AdapterQueryInput`, and gold answers/evidence are provably withheld (dedicated regression tests).
 - **Truthful accounting**: real `QueryUsage` and `QueryTiming` per query; staged failures (`retrieval_error` / `generation_error`) with retrieval evidence and timing preserved when generation fails.
 
-Remaining candidate architectures (LightRAG, Neo4j GraphRAG, Microsoft GraphRAG, RAPTOR, Hierarchical RAG) are planned for later phases.
+Remaining candidate architectures (Neo4j GraphRAG, Microsoft GraphRAG, RAPTOR, Hierarchical RAG) are planned for later phases.
 
 ---
 
-## 5. Run Artifact Layout & Single-Writer Model
+## 5. LightRAG Baseline (Phase 3D)
+
+The second candidate architecture is implemented: system `lightrag`, variant `hybrid_no_rerank` (`src/rag_benchmark/adapters/lightrag/`).
+
+- **Official integration**: Thin adapter over the official HKUDS `lightrag-hku` package, pinned to `lightrag-hku==1.5.7`. It is an **optional dependency** (`[project.optional-dependencies] lightrag`): the core package remains fully importable when the extra is not installed (lazy SDK imports).
+- **Benchmark variant `hybrid_no_rerank`**: hybrid query mode (LightRAG `QueryParam(mode="hybrid")` — combined local entity-level and global relationship-level KG retrieval); reranking disabled (`enable_rerank=False`), streaming disabled, and LightRAG's LLM response caches disabled (`enable_llm_cache=False`, `enable_llm_cache_for_entity_extract=False`) so every benchmark query performs real provider work.
+- **Offline-deterministic chunking**: by default a deterministic offline character tokenizer (canonical 1200/100 windows) is injected, so no network BPE download occurs and normal tests require no network.
+- **Structured evidence normalization**: raw retrieved context is normalized to canonical `RetrievedEvidence` items (`chunk` / `entity` / `relationship`) with 1-based ranks, preserving `document_id` / `chunk_id` provenance where available.
+- **Canonical failure handling**: backend and query failures become canonical `QueryResult` failures with `StructuredError` bound to `(question_id, system, variant)`.
+- **Fairness contract**: `query()` receives only `AdapterQueryInput`; ground-truth answers/evidence never reach the adapter or the LightRAG backend; no reranking, HyDE, query rewriting, or hidden retrieval stages.
+- **Lifecycle**: the official LightRAG instance is initialized on first `index()` and finalized in `cleanup()`, which is idempotent and leaves the adapter re-indexable; adapter-owned working directories are removed on cleanup.
+
+---
+
+## 6. Run Artifact Layout & Single-Writer Model
 
 Each benchmark execution outputs artifacts into an isolated, safe run directory:
 
@@ -186,7 +201,7 @@ A centralized sanitization layer (`rag_benchmark.security.sanitizer`) protects c
 
 ---
 
-## 6. Development & Quality Gates
+## 7. Development & Quality Gates
 
 The harness relies on a modern toolchain:
 - **Python**: `>=3.11` (tested with Python 3.13)
