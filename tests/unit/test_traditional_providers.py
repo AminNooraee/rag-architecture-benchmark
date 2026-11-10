@@ -151,6 +151,138 @@ def test_openai_embedding_provider_rejects_length_mismatch(monkeypatch: pytest.M
         provider.embed_documents(["الف", "ب"])
 
 
+def test_openai_embedding_provider_rejects_missing_index(monkeypatch: pytest.MonkeyPatch) -> None:
+    _capturing_post(monkeypatch, {"data": [{"embedding": [0.0, 1.0]}]})
+    provider = OpenAICompatibleEmbeddingProvider("https://api.example/v1", model="emb-1")
+    with pytest.raises(RuntimeError, match="index"):
+        provider.embed_documents(["الف"])
+
+
+def test_openai_embedding_provider_rejects_duplicate_index(monkeypatch: pytest.MonkeyPatch) -> None:
+    _capturing_post(
+        monkeypatch,
+        {
+            "data": [
+                {"index": 0, "embedding": [0.0, 1.0]},
+                {"index": 0, "embedding": [1.0, 0.0]},
+            ]
+        },
+    )
+    provider = OpenAICompatibleEmbeddingProvider("https://api.example/v1", model="emb-1")
+    with pytest.raises(RuntimeError, match="duplicate"):
+        provider.embed_documents(["الف", "ب"])
+
+
+def test_openai_embedding_provider_rejects_out_of_range_index(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _capturing_post(
+        monkeypatch,
+        {
+            "data": [
+                {"index": 0, "embedding": [0.0, 1.0]},
+                {"index": 5, "embedding": [1.0, 0.0]},
+            ]
+        },
+    )
+    provider = OpenAICompatibleEmbeddingProvider("https://api.example/v1", model="emb-1")
+    with pytest.raises(RuntimeError, match="out of range"):
+        provider.embed_documents(["الف", "ب"])
+
+
+def test_openai_embedding_provider_rejects_boolean_index(monkeypatch: pytest.MonkeyPatch) -> None:
+    _capturing_post(monkeypatch, {"data": [{"index": True, "embedding": [0.0, 1.0]}]})
+    provider = OpenAICompatibleEmbeddingProvider("https://api.example/v1", model="emb-1")
+    with pytest.raises(RuntimeError, match="integer"):
+        provider.embed_documents(["الف"])
+
+
+def test_openai_embedding_provider_reorders_shuffled_three_entries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _capturing_post(
+        monkeypatch,
+        {
+            "data": [
+                {"index": 2, "embedding": [2.0, 0.0]},
+                {"index": 0, "embedding": [0.0, 1.0]},
+                {"index": 1, "embedding": [1.0, 0.0]},
+            ]
+        },
+    )
+    provider = OpenAICompatibleEmbeddingProvider("https://api.example/v1", model="emb-1")
+    assert provider.embed_documents(["الف", "ب", "ج"]) == [[0.0, 1.0], [1.0, 0.0], [2.0, 0.0]]
+
+
+def test_openai_embedding_provider_rejects_boolean_component(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _capturing_post(monkeypatch, {"data": [{"index": 0, "embedding": [True, 1.0]}]})
+    provider = OpenAICompatibleEmbeddingProvider("https://api.example/v1", model="emb-1")
+    with pytest.raises(RuntimeError, match="numeric"):
+        provider.embed_documents(["الف"])
+
+
+def test_openai_embedding_provider_rejects_nan_component(monkeypatch: pytest.MonkeyPatch) -> None:
+    _capturing_post(monkeypatch, {"data": [{"index": 0, "embedding": [float("nan"), 1.0]}]})
+    provider = OpenAICompatibleEmbeddingProvider("https://api.example/v1", model="emb-1")
+    with pytest.raises(RuntimeError, match="finite"):
+        provider.embed_documents(["الف"])
+
+
+def test_openai_embedding_provider_rejects_infinity_component(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _capturing_post(monkeypatch, {"data": [{"index": 0, "embedding": [float("inf"), 1.0]}]})
+    provider = OpenAICompatibleEmbeddingProvider("https://api.example/v1", model="emb-1")
+    with pytest.raises(RuntimeError, match="finite"):
+        provider.embed_documents(["الف"])
+
+
+def test_openai_embedding_provider_rejects_string_component(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _capturing_post(monkeypatch, {"data": [{"index": 0, "embedding": ["1.0", 2.0]}]})
+    provider = OpenAICompatibleEmbeddingProvider("https://api.example/v1", model="emb-1")
+    with pytest.raises(RuntimeError, match="numeric"):
+        provider.embed_documents(["الف"])
+
+
+def test_openai_embedding_query_requires_explicit_index_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _capturing_post(monkeypatch, {"data": [{"index": 1, "embedding": [0.5, 0.5]}]})
+    provider = OpenAICompatibleEmbeddingProvider("https://api.example/v1", model="emb-1")
+    with pytest.raises(RuntimeError, match="out of range"):
+        provider.embed_query("سؤال")
+
+
+def test_openai_llm_provider_rejects_negative_usage(monkeypatch: pytest.MonkeyPatch) -> None:
+    _capturing_post(
+        monkeypatch,
+        {
+            "choices": [{"message": {"content": "پاسخ"}}],
+            "usage": {"prompt_tokens": -1, "completion_tokens": 3},
+        },
+    )
+    provider = OpenAICompatibleLLMProvider("https://api.example/v1", model="llm-1")
+    with pytest.raises(RuntimeError, match="non-negative"):
+        provider.generate("سؤال", [], GenerationConfig())
+
+
+def test_openai_llm_provider_rejects_boolean_usage(monkeypatch: pytest.MonkeyPatch) -> None:
+    _capturing_post(
+        monkeypatch,
+        {
+            "choices": [{"message": {"content": "پاسخ"}}],
+            "usage": {"prompt_tokens": True, "completion_tokens": 3},
+        },
+    )
+    provider = OpenAICompatibleLLMProvider("https://api.example/v1", model="llm-1")
+    with pytest.raises(RuntimeError, match="non-negative"):
+        provider.generate("سؤال", [], GenerationConfig())
+
+
 def test_openai_llm_provider_generate(monkeypatch: pytest.MonkeyPatch) -> None:
     captured = _capturing_post(
         monkeypatch,

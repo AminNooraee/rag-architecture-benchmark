@@ -25,7 +25,11 @@ from rag_benchmark.adapters.base import (
 )
 from rag_benchmark.adapters.traditional.chunking import TextChunk, chunk_document
 from rag_benchmark.adapters.traditional.config import TraditionalRAGConfig
-from rag_benchmark.adapters.traditional.providers import EmbeddingProvider, LLMProvider
+from rag_benchmark.adapters.traditional.providers import (
+    EmbeddingProvider,
+    LLMGenerationResult,
+    LLMProvider,
+)
 from rag_benchmark.adapters.traditional.vector_index import ExactCosineIndex, validate_vector
 from rag_benchmark.config.models import (
     BenchmarkConfig,
@@ -63,9 +67,13 @@ class TraditionalVectorRAGAdapter(BaseRAGAdapter):
     ) -> None:
         self._embedding_provider = embedding_provider
         self._llm_provider = llm_provider
-        self._chunking_config: TraditionalRAGConfig = (
+        # The constructor/default chunking config is kept separately so that a
+        # prepare() without a "traditional_rag" extra key never inherits a
+        # previous explicit override.
+        self._constructor_chunking_config: TraditionalRAGConfig = (
             chunking_config if chunking_config is not None else TraditionalRAGConfig()
         )
+        self._chunking_config: TraditionalRAGConfig = self._constructor_chunking_config
         self._retrieval: RetrievalConfig | None = None
         self._generation: GenerationConfig | None = None
         self._embedding_config: EmbeddingConfig | None = None
@@ -99,15 +107,20 @@ class TraditionalVectorRAGAdapter(BaseRAGAdapter):
                 f"config.variant '{config.variant}' is not compatible with adapter "
                 f"variant '{_VARIANT_NAME}'"
             )
-        raw = config.extra.get("traditional_rag", {})
-        if not isinstance(raw, dict):
-            raise ConfigurationError(
-                "config.extra['traditional_rag'] must be a mapping when present"
-            )
-        try:
-            self._chunking_config = TraditionalRAGConfig.model_validate(dict(raw))
-        except ValidationError as e:
-            raise ConfigurationError(f"Invalid traditional_rag configuration: {e}") from e
+        if "traditional_rag" in config.extra:
+            raw = config.extra["traditional_rag"]
+            if not isinstance(raw, dict):
+                raise ConfigurationError(
+                    "config.extra['traditional_rag'] must be a mapping when present"
+                )
+            try:
+                self._chunking_config = TraditionalRAGConfig.model_validate(dict(raw))
+            except ValidationError as e:
+                raise ConfigurationError(f"Invalid traditional_rag configuration: {e}") from e
+        else:
+            # No override in this prepare(): keep (or restore) the
+            # constructor/default config rather than the previous value.
+            self._chunking_config = self._constructor_chunking_config
         self._retrieval = config.retrieval.model_copy(deep=True)
         self._generation = config.generation.model_copy(deep=True)
         self._embedding_config = config.embedding.model_copy(deep=True)
@@ -137,8 +150,26 @@ class TraditionalVectorRAGAdapter(BaseRAGAdapter):
         batch_size = embedding_config.batch_size
         for offset in range(0, len(chunks), batch_size):
             batch_texts = [chunk.text for chunk in chunks[offset : offset + batch_size]]
-            raw_vectors.extend(self._embedding_provider.embed_documents(batch_texts))
             batches += 1
+            try:
+                batch_vectors = self._embedding_provider.embed_documents(batch_texts)
+            except Exception as e:
+                # Safe, stable message: the original exception is chained for
+                # debugging but its text may carry provider details (including
+                # credentials) and must not reach public error messages.
+                raise BenchmarkException(
+                    f"Embedding provider failed during indexing (batch {batches})",
+                    error_type=BenchmarkErrorType.INDEXING_ERROR,
+                ) from e
+            # Per-batch alignment is checked before extending the aggregate so
+            # that per-batch over/under-counts cannot cancel out.
+            if len(batch_vectors) != len(batch_texts):
+                raise BenchmarkException(
+                    f"Embedding provider returned {len(batch_vectors)} vectors for "
+                    f"{len(batch_texts)} texts in indexing batch {batches}",
+                    error_type=BenchmarkErrorType.INDEXING_ERROR,
+                )
+            raw_vectors.extend(batch_vectors)
 
         if len(raw_vectors) != len(chunks):
             raise BenchmarkException(
@@ -146,7 +177,13 @@ class TraditionalVectorRAGAdapter(BaseRAGAdapter):
                 error_type=BenchmarkErrorType.INDEXING_ERROR,
             )
 
-        vectors = [validate_vector(vector) for vector in raw_vectors]
+        try:
+            vectors = [validate_vector(vector) for vector in raw_vectors]
+        except ValueError as e:
+            raise BenchmarkException(
+                f"Invalid embedding vector during indexing: {e}",
+                error_type=BenchmarkErrorType.INDEXING_ERROR,
+            ) from e
         embedding_dimension: int | None = len(vectors[0]) if vectors else None
         for position, vector in enumerate(vectors):
             if embedding_dimension is not None and len(vector) != embedding_dimension:
@@ -167,8 +204,14 @@ class TraditionalVectorRAGAdapter(BaseRAGAdapter):
             )
 
         index = ExactCosineIndex()
-        for chunk, vector in zip(chunks, vectors, strict=True):
-            index.add(chunk, vector)
+        try:
+            for chunk, vector in zip(chunks, vectors, strict=True):
+                index.add(chunk, vector)
+        except ValueError as e:
+            raise BenchmarkException(
+                f"Vector index construction failed during indexing: {e}",
+                error_type=BenchmarkErrorType.INDEXING_ERROR,
+            ) from e
 
         self._index = index
         self._indexed_documents = len(documents)
@@ -219,10 +262,13 @@ class TraditionalVectorRAGAdapter(BaseRAGAdapter):
         retrieval_start = total_start
         embedding_calls = 0
         try:
-            query_vector = self._embedding_provider.embed_query(query_input.question)
+            # Count the attempt before it runs so a failed embedding call is
+            # reported truthfully (one provider call was made).
             embedding_calls = 1
+            query_vector = self._embedding_provider.embed_query(query_input.question)
             vector = validate_vector(query_vector)
         except Exception as e:
+            retrieval_end = time.perf_counter()
             return QueryResult.create_failure(
                 question_id=question_id,
                 system=self.system_name,
@@ -230,16 +276,12 @@ class TraditionalVectorRAGAdapter(BaseRAGAdapter):
                 error_message=f"Query embedding failed: {e}",
                 error_type=BenchmarkErrorType.RETRIEVAL_ERROR,
                 usage=QueryUsage(embedding_calls=embedding_calls, llm_calls=0),
-                timing=_elapsed(
-                    retrieval_start=retrieval_start,
-                    generation_start=None,
-                    total_start=total_start,
-                    generation_ms=0.0,
-                ),
+                timing=_timing(retrieval_start, retrieval_end, None, None, total_start),
                 metadata={"stage": "retrieval"},
             )
         index_dimension = self._index.dimension
         if index_dimension is None or len(vector) != index_dimension:
+            retrieval_end = time.perf_counter()
             return QueryResult.create_failure(
                 question_id=question_id,
                 system=self.system_name,
@@ -250,12 +292,7 @@ class TraditionalVectorRAGAdapter(BaseRAGAdapter):
                 ),
                 error_type=BenchmarkErrorType.RETRIEVAL_ERROR,
                 usage=QueryUsage(embedding_calls=embedding_calls, llm_calls=0),
-                timing=_elapsed(
-                    retrieval_start=retrieval_start,
-                    generation_start=None,
-                    total_start=total_start,
-                    generation_ms=0.0,
-                ),
+                timing=_timing(retrieval_start, retrieval_end, None, None, total_start),
                 metadata={"stage": "retrieval"},
             )
 
@@ -276,16 +313,23 @@ class TraditionalVectorRAGAdapter(BaseRAGAdapter):
             for rank, (score, entry) in enumerate(results, start=1)
         ]
         context_texts = [item.text for item in evidence]
+        # Retrieval (query embedding + vector search + evidence construction)
+        # is complete; capture its end once, before generation begins.
+        retrieval_end = time.perf_counter()
 
-        generation_start = time.perf_counter()
+        generation_start = retrieval_end
         # The single generation call is attempted; count it even if the
         # provider fails, so usage reflects real provider traffic.
         llm_calls = 1
         try:
-            llm_result = self._llm_provider.generate(
-                query_input.question, context_texts, generation_config
+            llm_result = _normalize_generation_result(
+                self._llm_provider.generate(query_input.question, context_texts, generation_config)
             )
         except Exception as e:
+            generation_end = time.perf_counter()
+            timing = _timing(
+                retrieval_start, retrieval_end, generation_start, generation_end, total_start
+            )
             return QueryResult.create_failure(
                 question_id=question_id,
                 system=self.system_name,
@@ -294,15 +338,14 @@ class TraditionalVectorRAGAdapter(BaseRAGAdapter):
                 error_type=BenchmarkErrorType.GENERATION_ERROR,
                 retrieved_evidence=evidence,
                 usage=QueryUsage(embedding_calls=embedding_calls, llm_calls=llm_calls),
-                timing=_elapsed(
-                    retrieval_start=retrieval_start,
-                    generation_start=generation_start,
-                    total_start=total_start,
-                    generation_ms=(time.perf_counter() - generation_start) * 1000.0,
-                ),
+                timing=timing,
                 metadata={"stage": "generation"},
             )
         if not llm_result.answer.strip():
+            generation_end = time.perf_counter()
+            timing = _timing(
+                retrieval_start, retrieval_end, generation_start, generation_end, total_start
+            )
             return QueryResult.create_failure(
                 question_id=question_id,
                 system=self.system_name,
@@ -311,15 +354,14 @@ class TraditionalVectorRAGAdapter(BaseRAGAdapter):
                 error_type=BenchmarkErrorType.GENERATION_ERROR,
                 retrieved_evidence=evidence,
                 usage=QueryUsage(embedding_calls=embedding_calls, llm_calls=llm_calls),
-                timing=_elapsed(
-                    retrieval_start=retrieval_start,
-                    generation_start=generation_start,
-                    total_start=total_start,
-                    generation_ms=(time.perf_counter() - generation_start) * 1000.0,
-                ),
+                timing=timing,
                 metadata={"stage": "generation"},
             )
 
+        generation_end = time.perf_counter()
+        timing = _timing(
+            retrieval_start, retrieval_end, generation_start, generation_end, total_start
+        )
         return QueryResult.create_success(
             question_id=question_id,
             system=self.system_name,
@@ -332,12 +374,7 @@ class TraditionalVectorRAGAdapter(BaseRAGAdapter):
                 input_tokens=llm_result.input_tokens or 0,
                 output_tokens=llm_result.output_tokens or 0,
             ),
-            timing=_elapsed(
-                retrieval_start=retrieval_start,
-                generation_start=generation_start,
-                total_start=total_start,
-                generation_ms=(time.perf_counter() - generation_start) * 1000.0,
-            ),
+            timing=timing,
             metadata={"retrieved_chunks": len(evidence)},
         )
 
@@ -372,18 +409,60 @@ class TraditionalVectorRAGAdapter(BaseRAGAdapter):
         self._indexed_chunks = 0
 
 
-def _elapsed(
+def _timing(
     retrieval_start: float,
+    retrieval_end: float,
     generation_start: float | None,
+    generation_end: float | None,
     total_start: float,
-    generation_ms: float,
 ) -> QueryTiming:
-    retrieval_ms = (time.perf_counter() - retrieval_start) * 1000.0
-    if generation_start is not None:
-        generation_ms = (time.perf_counter() - generation_start) * 1000.0
+    """Build stage timings from explicit stage boundaries.
+
+    retrieval_ms spans only the retrieval stage (query embedding + vector
+    search + evidence construction), using the end captured before generation
+    began. generation_ms spans only the LLM stage when it ran. total_ms spans
+    the whole query execution. Stage boundaries are never recomputed after the
+    fact, so generation latency can never inflate retrieval_ms.
+    """
+    retrieval_ms = (retrieval_end - retrieval_start) * 1000.0
+    generation_ms = 0.0
+    if generation_start is not None and generation_end is not None:
+        generation_ms = (generation_end - generation_start) * 1000.0
     total_ms = (time.perf_counter() - total_start) * 1000.0
     return QueryTiming(
         retrieval_ms=max(retrieval_ms, 0.0),
         generation_ms=max(generation_ms, 0.0),
         total_ms=max(total_ms, 0.0),
+    )
+
+
+def _normalize_token_count(value: object, name: str) -> int | None:
+    """Validate a provider-reported token count: None or a non-negative int.
+
+    Booleans, other types, and negative values are malformed and rejected at
+    the boundary so a provider violating the protocol cannot push invalid
+    values into the canonical usage record.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"LLM provider reported malformed {name}: expected a non-negative integer")
+    return value
+
+
+def _normalize_generation_result(result: object) -> LLMGenerationResult:
+    """Validate a provider's generation result at the adapter boundary.
+
+    Malformed results (non-string answer, invalid token counts, or arbitrary
+    objects) become ValueError here, which the caller turns into a canonical
+    GENERATION_ERROR failure; raw TypeError/AttributeError/ValidationError
+    never escape to the harness.
+    """
+    answer = getattr(result, "answer", None)
+    if not isinstance(answer, str):
+        raise ValueError("LLM provider result 'answer' must be a string")
+    input_tokens = _normalize_token_count(getattr(result, "input_tokens", None), "input_tokens")
+    output_tokens = _normalize_token_count(getattr(result, "output_tokens", None), "output_tokens")
+    return LLMGenerationResult(
+        answer=answer, input_tokens=input_tokens, output_tokens=output_tokens
     )

@@ -17,7 +17,7 @@ from rag_benchmark.adapters.traditional.vector_index import (
 def _chunk(document_id: str, ordinal: int, text: str = "متن") -> TextChunk:
     return TextChunk(
         document_id=document_id,
-        chunk_id=make_chunk_id(document_id, ordinal),
+        chunk_id=make_chunk_id(document_id, ordinal, 64, 0, 0, len(text), text),
         text=text,
         ordinal=ordinal,
         source="test-source",
@@ -67,9 +67,9 @@ def test_ranking_by_cosine_similarity() -> None:
     index.add(_chunk("d1", 2, "C"), (0.6, 0.8))
     results = index.search((1.0, 0.0), top_k=3)
     assert [entry.chunk.chunk_id for score, entry in results] == [
-        make_chunk_id("d1", 0),
-        make_chunk_id("d1", 2),
-        make_chunk_id("d1", 1),
+        _chunk("d1", 0, "A").chunk_id,
+        _chunk("d1", 2, "C").chunk_id,
+        _chunk("d1", 1, "B").chunk_id,
     ]
     assert [score for score, _ in results] == pytest.approx([1.0, 0.6, 0.0])
 
@@ -80,8 +80,8 @@ def test_tie_broken_by_chunk_id() -> None:
     index.add(_chunk("d1", 0, "A"), (1.0, 1.0))
     results = index.search((1.0, 1.0), top_k=2)
     assert [entry.chunk.chunk_id for _, entry in results] == [
-        make_chunk_id("d1", 0),
-        make_chunk_id("d1", 1),
+        _chunk("d1", 0, "A").chunk_id,
+        _chunk("d1", 1, "B").chunk_id,
     ]
     assert all(score == pytest.approx(1.0) for score, _ in results)
 
@@ -178,3 +178,35 @@ def test_all_scores_finite() -> None:
     results = index.search((1.0, 0.0), top_k=5)
     assert results
     assert all(math.isfinite(score) for score, _ in results)
+
+
+def test_cosine_similarity_huge_aligned_vectors() -> None:
+    score = cosine_similarity((1e308, 1e308), (1e308, 1e308))
+    assert math.isfinite(score)
+    assert score == pytest.approx(1.0, abs=1e-9)
+
+
+def test_cosine_similarity_huge_opposite_vectors() -> None:
+    score = cosine_similarity((1e308, 1e308), (-1e308, -1e308))
+    assert math.isfinite(score)
+    assert score == pytest.approx(-1.0, abs=1e-9)
+
+
+def test_cosine_similarity_mixed_magnitudes_stay_finite_and_bounded() -> None:
+    score = cosine_similarity((1e308, 1e308), (1.0, 2.0))
+    assert math.isfinite(score)
+    assert -1.0 <= score <= 1.0
+
+
+def test_search_with_huge_vectors_returns_finite_ranked_scores() -> None:
+    index = ExactCosineIndex()
+    index.add(_chunk("d1", 0, "huge+"), (1e308, 1e308))
+    index.add(_chunk("d1", 1, "huge-"), (-1e308, -1e308))
+    index.add(_chunk("d1", 2, "huge~"), (1e308, -1e308))
+    results = index.search((1e308, 0.0), top_k=3)
+    assert len(results) == 3
+    scores = [score for score, _ in results]
+    assert all(math.isfinite(score) for score in scores)
+    assert all(-1.0 <= score <= 1.0 for score in scores)
+    assert scores == sorted(scores, reverse=True)
+    assert results[0][1].chunk.chunk_id == _chunk("d1", 0, "huge+").chunk_id

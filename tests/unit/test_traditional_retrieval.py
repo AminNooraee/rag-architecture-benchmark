@@ -6,6 +6,7 @@ from typing import cast
 import pytest
 
 from rag_benchmark.adapters.traditional import TraditionalVectorRAGAdapter
+from rag_benchmark.adapters.traditional.chunking import make_chunk_id
 from rag_benchmark.config.models import BenchmarkConfig, RetrievalConfig
 from rag_benchmark.schemas.document import BenchmarkDocument
 from rag_benchmark.schemas.evidence import EvidenceType
@@ -59,7 +60,7 @@ def test_query_success_returns_ranked_evidence() -> None:
     assert len(evidence) == 2
     top = evidence[0]
     assert top.document_id == "doc-a"
-    assert top.chunk_id == "doc-a::chunk-000000"
+    assert top.chunk_id == make_chunk_id("doc-a", 0, 512, 0, 0, len(DOC_A), DOC_A)
     assert top.text == DOC_A
     assert top.score == pytest.approx(1.0)
     assert top.rank == 1

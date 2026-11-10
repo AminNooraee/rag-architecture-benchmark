@@ -19,6 +19,7 @@ from typing import get_type_hints
 import pytest
 
 from rag_benchmark.adapters.traditional import TraditionalVectorRAGAdapter
+from rag_benchmark.adapters.traditional.chunking import make_chunk_id
 from rag_benchmark.config.models import BenchmarkConfig, RetrievalConfig
 from rag_benchmark.schemas.document import BenchmarkDocument
 from rag_benchmark.schemas.evidence import EvidenceType, RetrievedEvidence
@@ -99,7 +100,7 @@ def test_end_to_end_success() -> None:
     assert [e.rank for e in evidence] == [1, 2, 3]
     assert [e.score for e in evidence] == pytest.approx([1.0, 0.8, 0.0])
     assert all(e.evidence_type == EvidenceType.CHUNK for e in evidence)
-    assert evidence[0].chunk_id == "doc1::chunk-000000"
+    assert evidence[0].chunk_id == make_chunk_id("doc1", 0, 512, 0, 0, len(DOC1_TEXT), DOC1_TEXT)
     assert evidence[0].text == DOC1_TEXT
     assert evidence[2].text == DOC3_TEXT
     assert ZWNJ in evidence[2].text

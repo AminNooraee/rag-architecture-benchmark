@@ -27,7 +27,10 @@ def test_chunk_ids_are_deterministic() -> None:
     assert [chunk.text for chunk in first] == [chunk.text for chunk in second]
     assert [chunk.ordinal for chunk in first] == [chunk.ordinal for chunk in second]
     for position, chunk in enumerate(first):
-        assert chunk.chunk_id == f"doc-1::chunk-{position:06d}"
+        assert chunk.chunk_id == make_chunk_id(
+            "doc-1", position, 64, 8, chunk.char_start, chunk.char_end, chunk.text
+        )
+        assert chunk.chunk_id.startswith(f"doc-1::chunk-{position:06d}::")
         assert chunk.ordinal == position
 
 
@@ -61,7 +64,9 @@ def test_empty_text_skipped_between_words() -> None:
     text = "alpha" + " " * 50 + "beta"
     chunks = chunk_document(_doc(text, "doc-gap"), 20, 0)
     assert [chunk.text for chunk in chunks] == ["alpha", "beta"]
-    assert chunks[1].chunk_id == make_chunk_id("doc-gap", 1)
+    assert chunks[1].chunk_id == make_chunk_id(
+        "doc-gap", 1, 20, 0, chunks[1].char_start, chunks[1].char_end, chunks[1].text
+    )
 
 
 def test_long_word_run_is_hard_cut() -> None:
@@ -115,3 +120,57 @@ def test_validate_chunking_params_rejects_invalid() -> None:
 def test_chunk_document_propagates_invalid_params() -> None:
     with pytest.raises(ValueError):
         chunk_document(_doc("متن"), 10, 10)
+
+
+def test_chunk_ids_deterministic_across_runs_with_full_identity() -> None:
+    doc = _doc(" ".join(f"کلمه{i}" for i in range(30)), "doc-ident")
+    first = chunk_document(doc, 64, 8)
+    second = chunk_document(doc, 64, 8)
+    assert len(first) > 1
+    for a, b in zip(first, second, strict=True):
+        assert a.chunk_id == b.chunk_id
+        assert a.chunk_id == make_chunk_id(
+            a.document_id, a.ordinal, 64, 8, a.char_start, a.char_end, a.text
+        )
+
+
+def test_chunk_ids_differ_across_chunk_size_config() -> None:
+    text = "aaaa bbbb cccc dddd eeee ffff"
+    small = chunk_document(_doc(text, "doc-cfg"), 12, 0)
+    large = chunk_document(_doc(text, "doc-cfg"), 24, 0)
+    assert small[0].chunk_id != large[0].chunk_id
+
+
+def test_chunk_ids_differ_across_overlap_config() -> None:
+    text = "aaaa bbbb cccc dddd"
+    no_overlap = chunk_document(_doc(text, "doc-ov"), 12, 0)
+    with_overlap = chunk_document(_doc(text, "doc-ov"), 12, 4)
+    assert no_overlap[1].chunk_id != with_overlap[1].chunk_id
+
+
+def test_chunk_ids_differ_when_text_changes() -> None:
+    a = make_chunk_id("doc-t", 0, 64, 8, 0, 10, "متن اول")
+    b = make_chunk_id("doc-t", 0, 64, 8, 0, 10, "متن دوم")
+    assert a != b
+    assert make_chunk_id("doc-t", 0, 64, 8, 0, 10, "متن اول") == a
+
+
+def test_chunk_ids_differ_when_span_changes() -> None:
+    a = make_chunk_id("doc-s", 0, 64, 8, 0, 10, "متن")
+    b = make_chunk_id("doc-s", 0, 64, 8, 5, 15, "متن")
+    assert a != b
+
+
+def test_chunk_ids_preserve_persian_and_zwnj_verbatim() -> None:
+    with_zwnj = make_chunk_id("doc-p", 0, 64, 8, 0, 10, f"نیم{ZWNJ}فاصله")
+    without_zwnj = make_chunk_id("doc-p", 0, 64, 8, 0, 10, "نیمفاصله")
+    assert with_zwnj != without_zwnj
+    assert make_chunk_id("doc-p", 0, 64, 8, 0, 10, f"نیم{ZWNJ}فاصله") == with_zwnj
+
+
+def test_chunk_id_format_has_ordinal_prefix_and_sha256_digest() -> None:
+    chunk_id = make_chunk_id("doc-fmt", 7, 64, 8, 0, 12, "متن")
+    prefix, digest = chunk_id.rsplit("::", 1)
+    assert prefix == "doc-fmt::chunk-000007"
+    assert len(digest) == 64
+    int(digest, 16)

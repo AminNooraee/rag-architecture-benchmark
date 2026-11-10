@@ -10,6 +10,7 @@ environment variables at wiring time.
 from __future__ import annotations
 
 import json
+import math
 import os
 import urllib.error
 import urllib.request
@@ -147,6 +148,42 @@ def _require_timeout(timeout_seconds: float) -> float:
     return timeout_seconds
 
 
+def _parse_embedding_vector(item: dict[str, object]) -> list[float]:
+    """Parse and validate one ``embedding`` list from an embedding response item.
+
+    Every component must be an int or float (bools are rejected explicitly),
+    finite (no NaN/Infinity), and strings/None are rejected. Valid int
+    components are converted to float after validation.
+    """
+    embedding = item.get("embedding")
+    if not isinstance(embedding, list):
+        raise RuntimeError("Embedding response item missing 'embedding' list")
+    if not embedding:
+        raise RuntimeError("Embedding response item has an empty 'embedding' list")
+    vector: list[float] = []
+    for position, value in enumerate(embedding):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise RuntimeError(f"Embedding component {position} must be numeric")
+        component = float(value)
+        if not math.isfinite(component):
+            raise RuntimeError(f"Embedding component {position} must be finite")
+        vector.append(component)
+    return vector
+
+
+def _parse_usage_count(value: object, name: str) -> int | None:
+    """Validate an LLM usage token count: None or a non-negative int.
+
+    Booleans and negative values are malformed and rejected rather than
+    silently dropped.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise RuntimeError(f"LLM response '{name}' must be a non-negative integer")
+    return value
+
+
 class OpenAICompatibleEmbeddingProvider:
     """Embedding provider for any OpenAI-compatible ``/embeddings`` endpoint."""
 
@@ -163,34 +200,38 @@ class OpenAICompatibleEmbeddingProvider:
         self._timeout = _require_timeout(timeout_seconds)
 
     def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
-        if not texts:
+        texts_list = list(texts)
+        if not texts_list:
             return []
-        payload: dict[str, object] = {"model": self._model, "input": list(texts)}
+        expected = len(texts_list)
+        payload: dict[str, object] = {"model": self._model, "input": texts_list}
         response = _post_json(f"{self._endpoint}/embeddings", payload, self._api_key, self._timeout)
         data = response.get("data")
-        if not isinstance(data, list) or len(data) != len(texts):
+        if not isinstance(data, list) or len(data) != expected:
             raise RuntimeError("Embedding response 'data' length does not match input texts")
-        ordered: list[tuple[int, dict[str, object]]] = []
-        for position, item in enumerate(data):
+        vectors_by_index: dict[int, list[float]] = {}
+        for item in data:
             if not isinstance(item, dict):
                 raise RuntimeError("Embedding response 'data' items must be JSON objects")
-            index = item.get("index", position)
-            if isinstance(index, bool) or not isinstance(index, int) or not 0 <= index < len(data):
+            if "index" not in item:
+                raise RuntimeError("Embedding response item is missing explicit 'index'")
+            index = item["index"]
+            if isinstance(index, bool) or not isinstance(index, int):
+                raise RuntimeError("Embedding response 'index' must be an integer")
+            if not 0 <= index < expected:
                 raise RuntimeError("Embedding response 'index' value is out of range")
-            ordered.append((index, item))
-        ordered.sort(key=lambda pair: pair[0])
-        vectors: list[list[float]] = []
-        for _, item in ordered:
-            embedding = item.get("embedding")
-            if not isinstance(embedding, list):
-                raise RuntimeError("Embedding response item missing 'embedding' list")
-            try:
-                vectors.append([float(value) for value in embedding])
-            except (TypeError, ValueError) as e:
-                raise RuntimeError("Embedding values must be numeric") from e
-        return vectors
+            if index in vectors_by_index:
+                raise RuntimeError("Embedding response contains duplicate 'index' values")
+            vectors_by_index[index] = _parse_embedding_vector(item)
+        if len(vectors_by_index) != expected:
+            raise RuntimeError("Embedding response 'index' values do not cover 0..N-1")
+        # Reorder strictly by the explicit index; response position is never
+        # used as a fallback, so shuffled responses come back in input order.
+        return [vectors_by_index[position] for position in range(expected)]
 
     def embed_query(self, text: str) -> list[float]:
+        # A single-text response must carry explicit index 0 (enforced by the
+        # shared validation in embed_documents).
         return self.embed_documents([text])[0]
 
 
@@ -240,12 +281,8 @@ class OpenAICompatibleLLMProvider:
         output_tokens: int | None = None
         usage = response.get("usage")
         if isinstance(usage, dict):
-            prompt_tokens = usage.get("prompt_tokens")
-            completion_tokens = usage.get("completion_tokens")
-            if isinstance(prompt_tokens, int) and not isinstance(prompt_tokens, bool):
-                input_tokens = prompt_tokens
-            if isinstance(completion_tokens, int) and not isinstance(completion_tokens, bool):
-                output_tokens = completion_tokens
+            input_tokens = _parse_usage_count(usage.get("prompt_tokens"), "prompt_tokens")
+            output_tokens = _parse_usage_count(usage.get("completion_tokens"), "completion_tokens")
         return LLMGenerationResult(
             answer=content, input_tokens=input_tokens, output_tokens=output_tokens
         )
