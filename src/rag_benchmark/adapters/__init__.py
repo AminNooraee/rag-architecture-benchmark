@@ -6,10 +6,13 @@ from rag_benchmark.adapters.base import (
     HealthCheckResult,
     IndexingResult,
 )
+from rag_benchmark.adapters.traditional import TraditionalRAGConfig, TraditionalVectorRAGAdapter
 
 __all__ = [
     "AdapterCapabilities",
     "BaseRAGAdapter",
     "HealthCheckResult",
     "IndexingResult",
+    "TraditionalRAGConfig",
+    "TraditionalVectorRAGAdapter",
 ]
