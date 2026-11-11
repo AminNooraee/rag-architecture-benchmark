@@ -65,9 +65,16 @@ def test_invalid_query_mode_rejected() -> None:
         LightRAGConfig(query_mode="local_global")  # type: ignore[arg-type]
 
 
-def test_query_mode_accepts_all_lightrag_modes() -> None:
-    for mode in ("local", "global", "hybrid", "naive", "mix", "bypass"):
-        assert LightRAGConfig(query_mode=mode).query_mode == mode
+def test_query_mode_explicit_hybrid_accepted() -> None:
+    assert LightRAGConfig(query_mode="hybrid").query_mode == "hybrid"
+
+
+@pytest.mark.parametrize("mode", ["local", "global", "naive", "mix", "bypass"])
+def test_query_mode_rejects_non_hybrid_modes(mode: str) -> None:
+    # Phase 3D pins the 'hybrid_no_rerank' variant to hybrid retrieval; any
+    # other mode would make the variant label lie about the run.
+    with pytest.raises(ValidationError):
+        LightRAGConfig(query_mode=mode)  # type: ignore[arg-type]
 
 
 def test_assignment_validation_enforced() -> None:

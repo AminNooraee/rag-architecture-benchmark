@@ -27,7 +27,7 @@ from rag_benchmark.errors.models import (  # noqa: E402
     ConfigurationError,
 )
 from rag_benchmark.schemas.document import BenchmarkDocument  # noqa: E402
-from rag_benchmark.schemas.evidence import EvidenceType  # noqa: E402
+from rag_benchmark.schemas.evidence import EvidenceType, RetrievedEvidence  # noqa: E402
 from rag_benchmark.schemas.question import AdapterQueryInput  # noqa: E402
 from rag_benchmark.schemas.result import QueryStatus  # noqa: E402
 from tests.unit.fakes import FakeEmbeddingProvider  # noqa: E402
@@ -392,22 +392,39 @@ def test_query_success_provenance_usage_and_timing(tmp_path: Path) -> None:
     assert result.timing.retrieval_ms + result.timing.generation_ms <= result.timing.total_ms + 1e-6
 
 
-def test_query_naive_mode_returns_chunks_only(tmp_path: Path) -> None:
+def test_prepare_rejects_non_hybrid_query_mode(tmp_path: Path) -> None:
+    adapter, _, _ = make_adapter(tmp_path)
+    with pytest.raises(ConfigurationError, match="Invalid lightrag configuration"):
+        adapter.prepare(make_config({"query_mode": "naive"}))
+    # The adapter keeps its pinned hybrid configuration.
+    assert adapter._lightrag_config.query_mode == "hybrid"
+
+
+def test_query_param_always_receives_hybrid_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     adapter, _, _ = make_adapter(
-        tmp_path,
-        extra={**LIGHTRAG_EXTRA, "query_mode": "naive"},
-        embedding=UniformEmbeddingProvider(),
+        tmp_path, extra=LIGHTRAG_EXTRA, embedding=UniformEmbeddingProvider()
     )
     _index_two_docs(adapter)
 
+    captured: dict[str, Any] = {}
+
+    async def fake_aquery_llm(question: str, param: Any = None, **kwargs: Any) -> dict[str, Any]:
+        captured["param"] = param
+        return {
+            "status": "success",
+            "message": "ok",
+            "llm_response": {"content": ANSWER},
+            "data": None,
+        }
+
+    monkeypatch.setattr(adapter._rag, "aquery_llm", fake_aquery_llm)
     result = adapter.query(AdapterQueryInput(question_id="q-1", question="پرسش"))
 
     assert result.status is QueryStatus.SUCCESS
-    assert result.answer == ANSWER
-    assert result.metadata["query_mode"] == "naive"
-    assert result.metadata["retrieved_entities"] == 0
-    assert result.metadata["retrieved_relationships"] == 0
-    assert all(e.evidence_type is EvidenceType.CHUNK for e in result.retrieved_evidence)
+    assert captured["param"].mode == "hybrid"
+    assert result.metadata["query_mode"] == "hybrid"
 
 
 def test_query_llm_failure_returns_failed_result(tmp_path: Path) -> None:
@@ -506,12 +523,17 @@ def test_cleanup_keeps_caller_owned_working_dir(tmp_path: Path) -> None:
 def test_health_reports_index_state(tmp_path: Path) -> None:
     adapter, _, _ = make_adapter(tmp_path, extra=LIGHTRAG_EXTRA)
     assert adapter.health().healthy is True
-    assert adapter.health().details["index_built"] is False
-    assert adapter.health().details["indexed_documents"] == 0
+    details = adapter.health().details
+    assert details["dependency_available"] is True
+    assert details["initialized"] is False
+    assert details["indexed"] is False
+    assert details["indexed_documents"] == 0
+    assert details["query_mode"] == "hybrid"
 
     _index_two_docs(adapter)
     details = adapter.health().details
-    assert details["index_built"] is True
+    assert details["initialized"] is True
+    assert details["indexed"] is True
     assert details["indexed_documents"] == 2
     assert details["indexed_chunks"] == 8
     assert details["embedding_dimension"] == 8
@@ -539,7 +561,6 @@ def test_evidence_mapping_from_raw_data() -> None:
         "chunks": [
             {"file_path": "doc-1", "chunk_id": "doc-1-chunk-001", "content": "متن یک"},
             {"file_path": "doc-2", "chunk_id": "doc-2-chunk-000", "content": ""},  # dropped
-            "not-a-dict",  # dropped
         ],
         "entities": [
             {
@@ -563,7 +584,8 @@ def test_evidence_mapping_from_raw_data() -> None:
             }
         ],
     }
-    evidence = LightRAGAdapter._evidence_from_raw_data(raw)
+    evidence: list[RetrievedEvidence] = []
+    assert LightRAGAdapter._evidence_from_raw_data(raw, evidence) is None
     assert [e.evidence_type for e in evidence] == [
         EvidenceType.CHUNK,
         EvidenceType.ENTITY,
@@ -589,13 +611,22 @@ def test_evidence_mapping_from_raw_data() -> None:
     assert relation.metadata["weight"] == 42.5
 
 
-def test_evidence_mapping_handles_unknown_source_and_non_dict() -> None:
+def test_evidence_mapping_handles_unknown_source() -> None:
     raw = {"chunks": [{"file_path": "unknown_source", "chunk_id": "c", "content": "x"}]}
-    evidence = LightRAGAdapter._evidence_from_raw_data(raw)
+    evidence: list[RetrievedEvidence] = []
+    assert LightRAGAdapter._evidence_from_raw_data(raw, evidence) is None
     assert len(evidence) == 1
     assert evidence[0].document_id is None
-    assert LightRAGAdapter._evidence_from_raw_data(None) == []
-    assert LightRAGAdapter._evidence_from_raw_data("not-a-dict") == []
+
+
+def test_evidence_mapping_rejects_non_dict_containers() -> None:
+    # data=None is a legitimate empty payload; a bare non-dict is malformed.
+    assert LightRAGAdapter._evidence_from_raw_data(None, []) is None
+    assert LightRAGAdapter._evidence_from_raw_data("not-a-dict", []) is not None
+    assert LightRAGAdapter._evidence_from_raw_data([1, 2], []) is not None
+    # A chunk list that is not a list of dicts is malformed.
+    assert LightRAGAdapter._evidence_from_raw_data({"chunks": "garbage"}, []) is not None
+    assert LightRAGAdapter._evidence_from_raw_data({"chunks": ["not-a-dict"]}, []) is not None
 
 
 def test_evidence_mapping_splits_merged_file_paths() -> None:
@@ -621,8 +652,43 @@ def test_evidence_mapping_splits_merged_file_paths() -> None:
             }
         ],
     }
-    entity, relation = LightRAGAdapter._evidence_from_raw_data(raw)
+    evidence: list[RetrievedEvidence] = []
+    assert LightRAGAdapter._evidence_from_raw_data(raw, evidence) is None
+    entity, relation = evidence
     assert entity.document_id == "doc-3"
     assert entity.metadata["source_file_paths"] == ["doc-3", "doc-4"]
     assert relation.document_id == "doc-3"
     assert relation.metadata["source_file_paths"] == ["doc-3", "doc-4"]
+
+
+def test_evidence_mapping_ignores_empty_segments_of_merged_paths() -> None:
+    # Repeated/trailing delimiters must not create bogus blank document IDs.
+    raw = {
+        "entities": [
+            {
+                "entity_name": "تهران",
+                "entity_type": "location",
+                "description": "توضیح",
+                "source_id": "doc-3-chunk-000",
+                "file_path": "doc-3<SEP><SEP>doc-4",
+            }
+        ],
+        "relationships": [
+            {
+                "src_id": "a",
+                "tgt_id": "b",
+                "keywords": "k",
+                "weight": 1.5,
+                "description": "رابطه",
+                "source_id": "doc-3-chunk-000",
+                "file_path": "doc-3<SEP>",
+            }
+        ],
+    }
+    evidence: list[RetrievedEvidence] = []
+    assert LightRAGAdapter._evidence_from_raw_data(raw, evidence) is None
+    entity, relation = evidence
+    assert entity.document_id == "doc-3"
+    assert entity.metadata["source_file_paths"] == ["doc-3", "doc-4"]
+    assert relation.document_id == "doc-3"
+    assert "source_file_paths" not in relation.metadata

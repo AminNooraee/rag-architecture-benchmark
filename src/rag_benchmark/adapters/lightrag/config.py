@@ -22,13 +22,13 @@ class LightRAGConfig(BaseModel):
 
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
-    query_mode: Literal["local", "global", "hybrid", "naive", "mix", "bypass"] = Field(
+    query_mode: Literal["hybrid"] = Field(
         default="hybrid",
         description=(
-            "LightRAG QueryParam mode. The benchmark default 'hybrid' combines "
-            "local (entity-level) and global (relationship-level) KG retrieval; "
-            "'naive' is vector-only retrieval; 'mix' adds vector chunks to "
-            "local+global KG retrieval."
+            "LightRAG QueryParam mode. Phase 3D pins the 'hybrid_no_rerank' "
+            "variant to 'hybrid' (combined local entity-level and global "
+            "relationship-level KG retrieval); the variant label must match "
+            "the run, so every other mode is rejected at validation time."
         ),
     )
     chunk_token_size: int = Field(

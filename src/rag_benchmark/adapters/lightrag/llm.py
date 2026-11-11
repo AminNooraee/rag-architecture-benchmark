@@ -14,13 +14,14 @@ time (empty is allowed for local endpoints without authentication).
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import os
 import time
 import urllib.error
 import urllib.request
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from rag_benchmark.config.models import GenerationConfig, LLMConfig
@@ -47,6 +48,75 @@ class LLMCallRecord:
         if self.end is None:
             return 0.0
         return max((self.end - self.start) * 1000.0, 0.0)
+
+
+@dataclass
+class QueryUsageContext:
+    """Query-local provider-call accounting.
+
+    Bound to the running execution context for exactly one ``query()`` call.
+    Sequential and interleaved queries each observe their own context, so
+    provider calls (including failed attempts) can never leak between queries
+    or from indexing into query accounting.
+    """
+
+    llm_records: list[LLMCallRecord] = field(default_factory=list)
+    embedding_calls: int = 0
+
+    @property
+    def llm_calls(self) -> int:
+        return len(self.llm_records)
+
+    @property
+    def input_tokens(self) -> int:
+        return sum(record.input_tokens for record in self.llm_records)
+
+    @property
+    def output_tokens(self) -> int:
+        return sum(record.output_tokens for record in self.llm_records)
+
+    @property
+    def last_llm_elapsed_ms(self) -> float:
+        return self.llm_records[-1].elapsed_ms if self.llm_records else 0.0
+
+
+#: Active per-query accounting context (None outside of query() execution).
+_QUERY_USAGE_CONTEXT: contextvars.ContextVar[QueryUsageContext | None] = contextvars.ContextVar(
+    "rag_benchmark_lightrag_query_usage", default=None
+)
+
+
+def bind_query_usage_context(
+    context: QueryUsageContext,
+) -> contextvars.Token[QueryUsageContext | None]:
+    """Bind a fresh accounting context for the current execution context."""
+    return _QUERY_USAGE_CONTEXT.set(context)
+
+
+def reset_query_usage_context(token: contextvars.Token[QueryUsageContext | None]) -> None:
+    _QUERY_USAGE_CONTEXT.reset(token)
+
+
+def record_llm_call(record: LLMCallRecord) -> None:
+    """Record an LLM call into the active query context, if one is bound.
+
+    Indexing-time LLM calls (entity/relation extraction) run with no bound
+    context and are intentionally excluded from query accounting.
+    """
+    context = _QUERY_USAGE_CONTEXT.get()
+    if context is not None:
+        context.llm_records.append(record)
+
+
+def record_embedding_call() -> None:
+    """Count one embedding provider invocation into the active query context.
+
+    Must be called BEFORE the provider is invoked so a failed attempt is
+    still counted; no-op outside a bound query context (indexing).
+    """
+    context = _QUERY_USAGE_CONTEXT.get()
+    if context is not None:
+        context.embedding_calls += 1
 
 
 def build_messages(
@@ -144,13 +214,12 @@ def build_default_llm_func(
     *,
     llm_config: LLMConfig,
     generation: GenerationConfig,
-    recorder: list[LLMCallRecord],
 ) -> LightRAGLLMFunc:
     """Build the default LightRAG ``llm_model_func`` from benchmark config.
 
-    Every call is recorded in ``recorder`` (wall-clock bounds plus provider
-    token usage) so the adapter can attribute generation latency and usage to
-    a single query without wrapping the call site.
+    Every call is recorded (wall-clock bounds plus provider token usage) into
+    the query-local ``QueryUsageContext`` bound by the adapter for the current
+    ``query()`` execution; calls made outside a query (indexing) are dropped.
     """
     endpoint = llm_config.endpoint.rstrip("/")
     model = llm_config.model
@@ -166,7 +235,7 @@ def build_default_llm_func(
         if not prompt.strip():
             raise RuntimeError("LightRAG forwarded an empty prompt to the LLM endpoint")
         record = LLMCallRecord(start=time.perf_counter())
-        recorder.append(record)
+        record_llm_call(record)
         try:
             messages = build_messages(prompt, system_prompt, history_messages)
             loop = asyncio.get_running_loop()

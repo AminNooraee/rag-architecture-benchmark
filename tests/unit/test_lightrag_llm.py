@@ -12,17 +12,19 @@ import json
 import urllib.error
 import urllib.request
 from email.message import Message
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 import pytest
 
 from rag_benchmark.adapters.lightrag import llm as llm_module
 from rag_benchmark.adapters.lightrag.llm import (
-    LLMCallRecord,
+    QueryUsageContext,
     _blocking_chat,
     _parse_usage_count,
+    bind_query_usage_context,
     build_default_llm_func,
     build_messages,
+    reset_query_usage_context,
 )
 from rag_benchmark.adapters.lightrag.tokenizer import (
     CharacterTokenizer,
@@ -40,6 +42,21 @@ def _configs() -> tuple[LLMConfig, GenerationConfig]:
         }
     )
     return llm_config, GenerationConfig()
+
+
+def run_llm_with_usage(coro: Any) -> tuple[Any, QueryUsageContext]:
+    """Run an LLM func coroutine with a bound query usage context.
+
+    Mirrors how the adapter binds a context for one query(); the context is
+    reset afterwards so calls never leak between queries.
+    """
+    usage = QueryUsageContext()
+    token = bind_query_usage_context(usage)
+    try:
+        result = asyncio.run(coro)
+    finally:
+        reset_query_usage_context(token)
+    return result, usage
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +141,6 @@ def test_default_llm_func_records_usage_and_returns_content(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     llm_config, generation = _configs()
-    recorder: list[LLMCallRecord] = []
     captured: dict[str, object] = {}
 
     def fake_blocking_chat(
@@ -143,9 +159,9 @@ def test_default_llm_func_records_usage_and_returns_content(
 
     monkeypatch.setattr(llm_module, "_blocking_chat", fake_blocking_chat)
     monkeypatch.delenv(llm_module.LLM_API_KEY_ENV, raising=False)
-    func = build_default_llm_func(llm_config=llm_config, generation=generation, recorder=recorder)
+    func = build_default_llm_func(llm_config=llm_config, generation=generation)
 
-    result = asyncio.run(func("پرسش آزمایشی", system_prompt="سیستم"))
+    result, usage = run_llm_with_usage(func("پرسش آزمایشی", system_prompt="سیستم"))
 
     assert result == "جواب تستی"
     assert captured["endpoint"] == "http://localhost:9999/v1"
@@ -155,11 +171,11 @@ def test_default_llm_func_records_usage_and_returns_content(
         {"role": "system", "content": "سیستم"},
         {"role": "user", "content": "پرسش آزمایشی"},
     ]
-    assert len(recorder) == 1
-    assert recorder[0].input_tokens == 11
-    assert recorder[0].output_tokens == 4
-    assert recorder[0].elapsed_ms >= 0.0
-    assert recorder[0].end is not None
+    assert len(usage.llm_records) == 1
+    assert usage.llm_records[0].input_tokens == 11
+    assert usage.llm_records[0].output_tokens == 4
+    assert usage.llm_records[0].elapsed_ms >= 0.0
+    assert usage.llm_records[0].end is not None
 
 
 def test_default_llm_func_reads_api_key_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -179,9 +195,9 @@ def test_default_llm_func_reads_api_key_from_environment(monkeypatch: pytest.Mon
 
     monkeypatch.setattr(llm_module, "_blocking_chat", fake_blocking_chat)
     monkeypatch.setenv(llm_module.LLM_API_KEY_ENV, "  test-key  ")
-    func = build_default_llm_func(llm_config=llm_config, generation=generation, recorder=[])
+    func = build_default_llm_func(llm_config=llm_config, generation=generation)
 
-    asyncio.run(func("پرسش"))
+    run_llm_with_usage(func("پرسش"))
 
     assert captured["api_key"] == "test-key"
 
@@ -189,29 +205,33 @@ def test_default_llm_func_reads_api_key_from_environment(monkeypatch: pytest.Mon
 def test_default_llm_func_empty_prompt_raises(monkeypatch: pytest.MonkeyPatch) -> None:
     llm_config, generation = _configs()
     monkeypatch.setattr(llm_module, "_blocking_chat", lambda *a, **k: ("x", 0, 0))
-    func = build_default_llm_func(llm_config=llm_config, generation=generation, recorder=[])
+    func = build_default_llm_func(llm_config=llm_config, generation=generation)
 
     with pytest.raises(RuntimeError, match="empty prompt"):
-        asyncio.run(func("   "))
+        run_llm_with_usage(func("   "))
 
 
 def test_default_llm_func_records_when_chat_fails(monkeypatch: pytest.MonkeyPatch) -> None:
     llm_config, generation = _configs()
-    recorder: list[LLMCallRecord] = []
 
     def boom(*args: object, **kwargs: object) -> tuple[str, int, int]:
         raise RuntimeError("boom")
 
     monkeypatch.setattr(llm_module, "_blocking_chat", boom)
-    func = build_default_llm_func(llm_config=llm_config, generation=generation, recorder=recorder)
+    func = build_default_llm_func(llm_config=llm_config, generation=generation)
 
-    with pytest.raises(RuntimeError, match="boom"):
-        asyncio.run(func("پرسش"))
+    usage = QueryUsageContext()
+    token = bind_query_usage_context(usage)
+    try:
+        with pytest.raises(RuntimeError, match="boom"):
+            asyncio.run(func("پرسش"))
+    finally:
+        reset_query_usage_context(token)
 
-    assert len(recorder) == 1
-    assert recorder[0].end is not None
-    assert recorder[0].input_tokens == 0
-    assert recorder[0].output_tokens == 0
+    assert len(usage.llm_records) == 1
+    assert usage.llm_records[0].end is not None
+    assert usage.llm_records[0].input_tokens == 0
+    assert usage.llm_records[0].output_tokens == 0
 
 
 # ---------------------------------------------------------------------------

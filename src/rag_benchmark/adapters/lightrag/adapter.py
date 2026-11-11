@@ -60,7 +60,12 @@ from rag_benchmark.adapters.lightrag.config import LightRAGConfig
 from rag_benchmark.adapters.lightrag.llm import (
     LightRAGLLMFunc,
     LLMCallRecord,
+    QueryUsageContext,
+    bind_query_usage_context,
     build_default_llm_func,
+    record_embedding_call,
+    record_llm_call,
+    reset_query_usage_context,
 )
 from rag_benchmark.adapters.lightrag.tokenizer import build_offline_character_tokenizer
 from rag_benchmark.adapters.traditional.providers import EmbeddingProvider
@@ -90,32 +95,68 @@ _WORKING_DIR_PREFIX = "rag_benchmark_lightrag_"
 _lightrag_modules: SimpleNamespace | None = None
 
 
-def _require_lightrag() -> SimpleNamespace:
-    """Import the optional LightRAG dependency once, with a clear failure."""
-    global _lightrag_modules
-    if _lightrag_modules is not None:
-        return _lightrag_modules
+def _import_lightrag_modules() -> SimpleNamespace:
+    """Import the LightRAG symbols used by the adapter.
+
+    Exception semantics:
+      - the top-level ``lightrag`` package is missing (
+        ``ModuleNotFoundError`` with ``name`` ``lightrag``) -> a clear
+        optional-dependency :class:`ConfigurationError`;
+      - LightRAG is installed but broken (an internal module or dependency
+        fails to import) -> the real import failure is re-raised untouched.
+    """
     try:
         from lightrag import LightRAG, QueryParam  # type: ignore[import-untyped]
         from lightrag.utils import (  # type: ignore[import-untyped]
             EmbeddingFunc,
             always_get_an_event_loop,
         )
-    except ImportError as e:
-        raise ConfigurationError(
-            "The optional 'lightrag' dependency is not installed. "
-            "Install it with `uv sync --extra lightrag`."
-        ) from e
-    # LightRAG logs very verbosely at INFO; the benchmark wants quiet runs.
-    for logger_name in ("lightrag", "nano-vectordb"):
-        logging.getLogger(logger_name).setLevel(logging.WARNING)
-    _lightrag_modules = SimpleNamespace(
+    except ModuleNotFoundError as e:
+        if e.name is None or e.name == "lightrag":
+            raise ConfigurationError(
+                "The optional 'lightrag' dependency is not installed. "
+                "Install it with `uv sync --extra lightrag`."
+            ) from e
+        raise
+
+    return SimpleNamespace(
         LightRAG=LightRAG,
         QueryParam=QueryParam,
         EmbeddingFunc=EmbeddingFunc,
         always_get_an_event_loop=always_get_an_event_loop,
     )
-    return _lightrag_modules
+
+
+def _require_lightrag() -> SimpleNamespace:
+    """Import the optional LightRAG dependency once, with a clear failure."""
+    global _lightrag_modules
+    if _lightrag_modules is not None:
+        return _lightrag_modules
+    modules = _import_lightrag_modules()
+    # LightRAG logs very verbosely at INFO; the benchmark wants quiet runs.
+    for logger_name in ("lightrag", "nano-vectordb"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+    _lightrag_modules = modules
+    return modules
+
+
+def _lightrag_dependency_available() -> bool:
+    """Side-effect-free availability probe for the optional LightRAG dependency.
+
+    Never initializes LightRAG, never calls a provider, and never mutates
+    adapter state; returns False for any import failure (missing package or
+    broken internal dependency).
+    """
+    try:
+        import lightrag  # noqa: F401
+        from lightrag import LightRAG, QueryParam  # noqa: F401
+        from lightrag.utils import (  # noqa: F401
+            EmbeddingFunc,
+            always_get_an_event_loop,
+        )
+    except Exception:
+        return False
+    return True
 
 
 def _lightrag_version() -> str:
@@ -165,9 +206,6 @@ class LightRAGAdapter(BaseRAGAdapter):
         self._embedding_dimension: int | None = None
         self._indexed_documents = 0
         self._indexed_chunks = 0
-        # Per-query instrumentation (single event-loop thread appends here).
-        self._llm_log: list[LLMCallRecord] = []
-        self._embed_call_sizes: list[int] = []
 
     @property
     def system_name(self) -> str:
@@ -232,9 +270,12 @@ class LightRAGAdapter(BaseRAGAdapter):
                 self._working_dir = None
             self._indexed_documents = 0
             self._indexed_chunks = 0
+        # Validate the batch (duplicate / reserved delimiter IDs) before any
+        # LightRAG construction or insertion: a rejected batch must never
+        # touch the index.
+        ids, texts, seen = self._collect_batch(docs)
         self._ensure_rag(probe_text=self._first_nonempty_text(docs))
         assert self._rag is not None
-        ids, texts, seen = self._collect_batch(docs)
         indexed_chunks = 0
         if texts:
             try:
@@ -321,6 +362,12 @@ class LightRAGAdapter(BaseRAGAdapter):
         texts: list[str] = []
         seen: set[str] = set()
         for doc in docs:
+            if _GRAPH_FIELD_SEP in doc.document_id:
+                raise BenchmarkException(
+                    "Benchmark document_id contains reserved LightRAG provenance "
+                    f"delimiter '<SEP>': '{doc.document_id}'",
+                    error_type=BenchmarkErrorType.INDEXING_ERROR,
+                )
             if doc.document_id in seen:
                 raise ConfigurationError(
                     f"duplicate document_id '{doc.document_id}' in adapter batch"
@@ -373,6 +420,11 @@ class LightRAGAdapter(BaseRAGAdapter):
 
         async def _embed_texts(texts: list[str]) -> Any:
             loop = asyncio.get_running_loop()
+            # Count the embedding attempt BEFORE invoking the provider so a
+            # failed provider call is still accounted (matches failed-LLM
+            # attempt semantics). Outside a bound query context (indexing)
+            # the call is not attributed to any query.
+            record_embedding_call()
             vectors = await loop.run_in_executor(None, provider.embed_documents, list(texts))
             validated: list[list[float]] = []
             for position, vector in enumerate(vectors):
@@ -386,7 +438,6 @@ class LightRAGAdapter(BaseRAGAdapter):
                         f"embedding dimension mismatch within batch: "
                         f"{len(vector)} != {reference_dim} at texts[{position + 1}]"
                     )
-            self._embed_call_sizes.append(len(texts))
             import numpy as np  # local: keeps the module importable without the extra
 
             return np.asarray(validated, dtype=np.float32)
@@ -396,9 +447,7 @@ class LightRAGAdapter(BaseRAGAdapter):
         if self._constructor_llm_func is not None:
             self._llm_func = self._wrap_injected_llm(self._constructor_llm_func)
         else:
-            self._llm_func = build_default_llm_func(
-                llm_config=llm_config, generation=generation, recorder=self._llm_log
-            )
+            self._llm_func = build_default_llm_func(llm_config=llm_config, generation=generation)
 
         ltr = self._lightrag_config
         rag_kwargs: dict[str, Any] = dict(
@@ -426,20 +475,41 @@ class LightRAGAdapter(BaseRAGAdapter):
             rag_kwargs["max_relation_tokens"] = ltr.max_relation_tokens
         if ltr.max_total_tokens is not None:
             rag_kwargs["max_total_tokens"] = ltr.max_total_tokens
+        rag: Any = None
         try:
-            self._rag = modules.LightRAG(**rag_kwargs)
-            self._run_async(self._rag.initialize_storages())
+            rag = modules.LightRAG(**rag_kwargs)
+            self._run_async(rag.initialize_storages())
         except ConfigurationError:
-            self._rag = None
+            self._discard_failed_rag(rag)
             raise
         except Exception as e:
-            self._rag = None
+            self._discard_failed_rag(rag)
             raise ConfigurationError(f"Failed to initialize LightRAG instance: {e}") from e
+        self._rag = rag
         self._embedding_dimension = dimension
 
-    def _wrap_injected_llm(self, base: LightRAGLLMFunc) -> LightRAGLLMFunc:
-        log = self._llm_log
+    def _discard_failed_rag(self, rag: Any) -> None:
+        """Best-effort finalization of a partially initialized LightRAG instance.
 
+        Never hides the original initialization failure (finalize errors are
+        swallowed), never assigns the instance to ``self._rag``, and removes
+        an adapter-owned working directory so no resources are leaked.
+        """
+        self._best_effort_finalize(rag)
+        if self._owns_working_dir and self._working_dir is not None:
+            shutil.rmtree(self._working_dir, ignore_errors=True)
+            self._working_dir = None
+
+    def _best_effort_finalize(self, rag: Any) -> None:
+        """Finalize storages of a constructed LightRAG instance, tolerating failure."""
+        if rag is None:
+            return
+        try:
+            self._run_async(rag.finalize_storages())
+        except Exception:
+            pass  # best effort; a finalize failure must not hide the original error
+
+    def _wrap_injected_llm(self, base: LightRAGLLMFunc) -> LightRAGLLMFunc:
         async def _wrapped(
             prompt: str,
             system_prompt: str | None = None,
@@ -447,7 +517,7 @@ class LightRAGAdapter(BaseRAGAdapter):
             **kwargs: Any,
         ) -> str:
             record = LLMCallRecord(start=time.perf_counter())
-            log.append(record)
+            record_llm_call(record)
             try:
                 # LightRAG's llm_model_func contract returns the raw answer string.
                 return cast(
@@ -577,102 +647,126 @@ class LightRAGAdapter(BaseRAGAdapter):
         param = modules.QueryParam(**param_kwargs)
 
         total_start = time.perf_counter()
-        llm_log_start = len(self._llm_log)
-        embed_log_start = len(self._embed_call_sizes)
+        # Query-local accounting: provider calls (including failed attempts)
+        # are recorded into this context and only this context is read below,
+        # so sequential or interleaved queries can never share accounting.
+        usage = QueryUsageContext()
+        token = bind_query_usage_context(usage)
         try:
-            full = self._run_async(
-                asyncio.wait_for(
-                    self._rag.aquery_llm(query_input.question, param=param),
-                    timeout=ltr.query_timeout_seconds,
+            try:
+                full = self._run_async(
+                    asyncio.wait_for(
+                        self._rag.aquery_llm(query_input.question, param=param),
+                        timeout=ltr.query_timeout_seconds,
+                    )
                 )
-            )
-        except TimeoutError:
+            except TimeoutError:
+                total_end = time.perf_counter()
+                return QueryResult.create_failure(
+                    question_id=question_id,
+                    system=self.system_name,
+                    variant=self.variant_name,
+                    error_message=(
+                        f"Query exceeded the wall-clock budget of "
+                        f"{ltr.query_timeout_seconds} seconds."
+                    ),
+                    error_type=BenchmarkErrorType.TIMEOUT,
+                    status=QueryStatus.TIMEOUT,
+                    usage=self._usage_from_context(usage),
+                    timing=self._query_timing(usage, total_start, total_end),
+                    metadata={"stage": "query", "query_mode": ltr.query_mode},
+                )
+            except Exception as e:
+                total_end = time.perf_counter()
+                return QueryResult.create_failure(
+                    question_id=question_id,
+                    system=self.system_name,
+                    variant=self.variant_name,
+                    error_message=f"LightRAG query failed: {e}",
+                    error_type=BenchmarkErrorType.RETRIEVAL_ERROR,
+                    usage=self._usage_from_context(usage),
+                    timing=self._query_timing(usage, total_start, total_end),
+                    metadata={"stage": "query", "query_mode": ltr.query_mode},
+                )
+
+            if not isinstance(full, dict) or full.get("status") != "success":
+                message = "LightRAG query pipeline reported a failure."
+                if isinstance(full, dict) and isinstance(full.get("message"), str):
+                    message = full["message"]
+                total_end = time.perf_counter()
+                return QueryResult.create_failure(
+                    question_id=question_id,
+                    system=self.system_name,
+                    variant=self.variant_name,
+                    error_message=f"LightRAG query pipeline failed: {message}",
+                    error_type=BenchmarkErrorType.RETRIEVAL_ERROR,
+                    usage=self._usage_from_context(usage),
+                    timing=self._query_timing(usage, total_start, total_end),
+                    metadata={"stage": "query", "query_mode": ltr.query_mode},
+                )
+
+            llm_response = full.get("llm_response")
+            answer = llm_response.get("content") if isinstance(llm_response, dict) else None
+            if not isinstance(answer, str) or not answer.strip():
+                total_end = time.perf_counter()
+                return QueryResult.create_failure(
+                    question_id=question_id,
+                    system=self.system_name,
+                    variant=self.variant_name,
+                    error_message="LightRAG returned an empty answer.",
+                    error_type=BenchmarkErrorType.GENERATION_ERROR,
+                    usage=self._usage_from_context(usage),
+                    timing=self._query_timing(usage, total_start, total_end),
+                    metadata={"stage": "generation", "query_mode": ltr.query_mode},
+                )
+
             total_end = time.perf_counter()
-            usage = self._usage_since(llm_log_start, embed_log_start)
-            return QueryResult.create_failure(
+            # Normalization of a successful LightRAG result is part of the
+            # protected query execution: a malformed raw payload must become
+            # a canonical failure, never an uncaught SDK/schema exception.
+            evidence: list[RetrievedEvidence] = []
+            normalization_error = self._evidence_from_raw_data(full.get("data"), evidence)
+            if normalization_error is not None:
+                return QueryResult.create_failure(
+                    question_id=question_id,
+                    system=self.system_name,
+                    variant=self.variant_name,
+                    error_message=(
+                        f"LightRAG returned malformed evidence data: {normalization_error}"
+                    ),
+                    error_type=BenchmarkErrorType.RETRIEVAL_ERROR,
+                    retrieved_evidence=evidence,
+                    usage=self._usage_from_context(usage),
+                    timing=self._query_timing(usage, total_start, total_end),
+                    metadata={"stage": "normalization", "query_mode": ltr.query_mode},
+                )
+            return QueryResult.create_success(
                 question_id=question_id,
                 system=self.system_name,
                 variant=self.variant_name,
-                error_message=(
-                    f"Query exceeded the wall-clock budget of {ltr.query_timeout_seconds} seconds."
-                ),
-                error_type=BenchmarkErrorType.TIMEOUT,
-                status=QueryStatus.TIMEOUT,
-                usage=usage,
-                timing=self._query_timing(llm_log_start, total_start, total_end),
-                metadata={"stage": "query", "query_mode": ltr.query_mode},
+                answer=answer,
+                retrieved_evidence=evidence,
+                usage=self._usage_from_context(usage),
+                timing=self._query_timing(usage, total_start, total_end),
+                metadata={
+                    "query_mode": ltr.query_mode,
+                    "retrieved_chunks": sum(
+                        1 for e in evidence if e.evidence_type is EvidenceType.CHUNK
+                    ),
+                    "retrieved_entities": sum(
+                        1 for e in evidence if e.evidence_type is EvidenceType.ENTITY
+                    ),
+                    "retrieved_relationships": sum(
+                        1 for e in evidence if e.evidence_type is EvidenceType.RELATIONSHIP
+                    ),
+                },
             )
-        except Exception as e:
-            total_end = time.perf_counter()
-            usage = self._usage_since(llm_log_start, embed_log_start)
-            return QueryResult.create_failure(
-                question_id=question_id,
-                system=self.system_name,
-                variant=self.variant_name,
-                error_message=f"LightRAG query failed: {e}",
-                error_type=BenchmarkErrorType.RETRIEVAL_ERROR,
-                usage=usage,
-                timing=self._query_timing(llm_log_start, total_start, total_end),
-                metadata={"stage": "query", "query_mode": ltr.query_mode},
-            )
+        finally:
+            reset_query_usage_context(token)
 
-        if not isinstance(full, dict) or full.get("status") != "success":
-            message = "LightRAG query pipeline reported a failure."
-            if isinstance(full, dict) and isinstance(full.get("message"), str):
-                message = full["message"]
-            total_end = time.perf_counter()
-            return QueryResult.create_failure(
-                question_id=question_id,
-                system=self.system_name,
-                variant=self.variant_name,
-                error_message=f"LightRAG query pipeline failed: {message}",
-                error_type=BenchmarkErrorType.RETRIEVAL_ERROR,
-                usage=self._usage_since(llm_log_start, embed_log_start),
-                timing=self._query_timing(llm_log_start, total_start, total_end),
-                metadata={"stage": "query", "query_mode": ltr.query_mode},
-            )
-
-        llm_response = full.get("llm_response")
-        answer = llm_response.get("content") if isinstance(llm_response, dict) else None
-        if not isinstance(answer, str) or not answer.strip():
-            total_end = time.perf_counter()
-            return QueryResult.create_failure(
-                question_id=question_id,
-                system=self.system_name,
-                variant=self.variant_name,
-                error_message="LightRAG returned an empty answer.",
-                error_type=BenchmarkErrorType.GENERATION_ERROR,
-                usage=self._usage_since(llm_log_start, embed_log_start),
-                timing=self._query_timing(llm_log_start, total_start, total_end),
-                metadata={"stage": "generation", "query_mode": ltr.query_mode},
-            )
-
-        total_end = time.perf_counter()
-        evidence = self._evidence_from_raw_data(full.get("data"))
-        return QueryResult.create_success(
-            question_id=question_id,
-            system=self.system_name,
-            variant=self.variant_name,
-            answer=answer,
-            retrieved_evidence=evidence,
-            usage=self._usage_since(llm_log_start, embed_log_start),
-            timing=self._query_timing(llm_log_start, total_start, total_end),
-            metadata={
-                "query_mode": ltr.query_mode,
-                "retrieved_chunks": sum(
-                    1 for e in evidence if e.evidence_type is EvidenceType.CHUNK
-                ),
-                "retrieved_entities": sum(
-                    1 for e in evidence if e.evidence_type is EvidenceType.ENTITY
-                ),
-                "retrieved_relationships": sum(
-                    1 for e in evidence if e.evidence_type is EvidenceType.RELATIONSHIP
-                ),
-            },
-        )
-
+    @staticmethod
     def _query_timing(
-        self, llm_log_start: int, total_start: float, total_end: float
+        usage: QueryUsageContext, total_start: float, total_end: float
     ) -> QueryTiming:
         """Split wall-clock time between the fused retrieval+generation stages.
 
@@ -683,8 +777,7 @@ class LightRAGAdapter(BaseRAGAdapter):
         retrieval_ms is the remaining wall-clock time.
         """
         total_ms = max((total_end - total_start) * 1000.0, 0.0)
-        calls = self._llm_log[llm_log_start:]
-        generation_ms = calls[-1].elapsed_ms if calls else 0.0
+        generation_ms = usage.last_llm_elapsed_ms
         retrieval_ms = max(total_ms - generation_ms, 0.0)
         return QueryTiming(
             retrieval_ms=retrieval_ms,
@@ -692,47 +785,73 @@ class LightRAGAdapter(BaseRAGAdapter):
             total_ms=total_ms,
         )
 
-    def _usage_since(self, llm_log_start: int, embed_log_start: int) -> QueryUsage:
-        calls = self._llm_log[llm_log_start:]
-        input_tokens = sum(record.input_tokens for record in calls)
-        output_tokens = sum(record.output_tokens for record in calls)
-        embedding_calls = len(self._embed_call_sizes[embed_log_start:])
+    @staticmethod
+    def _usage_from_context(usage: QueryUsageContext) -> QueryUsage:
+        """Build the canonical QueryUsage from this query's own context only."""
         return QueryUsage(
-            llm_calls=len(calls),
-            embedding_calls=embedding_calls,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
+            llm_calls=usage.llm_calls,
+            embedding_calls=usage.embedding_calls,
+            input_tokens=usage.input_tokens,
+            output_tokens=usage.output_tokens,
         )
 
     @staticmethod
-    def _evidence_from_raw_data(data: Any) -> list[RetrievedEvidence]:
+    def _evidence_from_raw_data(data: Any, evidence: list[RetrievedEvidence]) -> str | None:
         """Map LightRAG's raw query data to canonical RetrievedEvidence.
+
+        Appends normalized items to ``evidence`` in retrieval order and
+        returns ``None`` on success. If the raw payload is malformed
+        (bad container types, non-finite numeric fields) a human-readable
+        error message is returned instead; items already normalized before
+        the failure remain in ``evidence`` so the caller can report a
+        canonical failure with the partial provenance.
+        """
+        try:
+            LightRAGAdapter._normalize_evidence(data, evidence)
+        except Exception as e:
+            return str(e) or type(e).__name__
+        return None
+
+    @staticmethod
+    def _normalize_evidence(data: Any, evidence: list[RetrievedEvidence]) -> None:
+        """Strict normalization; raises on any malformed raw_data structure.
 
         Chunks carry the benchmark document id in ``file_path`` (set at insert
         time), the LightRAG chunk id in ``chunk_id``, and the text in
         ``content``. Entities/relationships carry their source document in
         ``file_path``; their LLM-generated description is the evidence text.
         """
+        if data is None:
+            return
         if not isinstance(data, dict):
-            return []
-        evidence: list[RetrievedEvidence] = []
+            raise ValueError(f"raw data container must be a dict, got {type(data).__name__}")
+        for key in ("chunks", "entities", "relationships"):
+            items = data.get(key)
+            if items is None:
+                continue
+            if not isinstance(items, list):
+                raise ValueError(f"raw data '{key}' must be a list, got {type(items).__name__}")
         rank = 1
         chunks = data.get("chunks")
         if isinstance(chunks, list):
             for chunk in chunks:
                 if not isinstance(chunk, dict):
-                    continue
-                content = chunk.get("content")
+                    raise ValueError(f"raw chunk item must be a dict, got {type(chunk).__name__}")
+                content = _clean_field(chunk.get("content"), "chunk.content")
                 if not isinstance(content, str) or not content.strip():
                     continue
-                paths = _file_paths_from_raw(chunk.get("file_path"))
+                paths = _file_paths_from_raw(
+                    _clean_field(chunk.get("file_path"), "chunk.file_path")
+                )
                 chunk_metadata: dict[str, Any] = {}
                 if len(paths) > 1:
                     chunk_metadata["source_file_paths"] = paths
                 evidence.append(
                     RetrievedEvidence(
                         document_id=paths[0] if paths else None,
-                        chunk_id=_string_or_none(chunk.get("chunk_id")),
+                        chunk_id=_string_or_none(
+                            _clean_field(chunk.get("chunk_id"), "chunk.chunk_id")
+                        ),
                         text=content,
                         rank=rank,
                         evidence_type=EvidenceType.CHUNK,
@@ -744,21 +863,29 @@ class LightRAGAdapter(BaseRAGAdapter):
         if isinstance(entities, list):
             for entity in entities:
                 if not isinstance(entity, dict):
-                    continue
-                description = entity.get("description")
+                    raise ValueError(f"raw entity item must be a dict, got {type(entity).__name__}")
+                description = _clean_field(entity.get("description"), "entity.description")
                 if not isinstance(description, str) or not description.strip():
                     continue
-                paths = _file_paths_from_raw(entity.get("file_path"))
+                paths = _file_paths_from_raw(
+                    _clean_field(entity.get("file_path"), "entity.file_path")
+                )
                 entity_metadata: dict[str, Any] = {
-                    "entity_name": _string_or_none(entity.get("entity_name")),
-                    "entity_type": _string_or_none(entity.get("entity_type")),
+                    "entity_name": _string_or_none(
+                        _clean_field(entity.get("entity_name"), "entity.entity_name")
+                    ),
+                    "entity_type": _string_or_none(
+                        _clean_field(entity.get("entity_type"), "entity.entity_type")
+                    ),
                 }
                 if len(paths) > 1:
                     entity_metadata["source_file_paths"] = paths
                 evidence.append(
                     RetrievedEvidence(
                         document_id=paths[0] if paths else None,
-                        chunk_id=_string_or_none(entity.get("source_id")),
+                        chunk_id=_string_or_none(
+                            _clean_field(entity.get("source_id"), "entity.source_id")
+                        ),
                         text=description,
                         rank=rank,
                         evidence_type=EvidenceType.ENTITY,
@@ -770,26 +897,36 @@ class LightRAGAdapter(BaseRAGAdapter):
         if isinstance(relationships, list):
             for relation in relationships:
                 if not isinstance(relation, dict):
-                    continue
-                description = relation.get("description")
+                    raise ValueError(
+                        f"raw relationship item must be a dict, got {type(relation).__name__}"
+                    )
+                description = _clean_field(relation.get("description"), "relationship.description")
                 if not isinstance(description, str) or not description.strip():
                     continue
-                weight = relation.get("weight")
-                paths = _file_paths_from_raw(relation.get("file_path"))
+                weight = _finite_evidence_number(relation.get("weight"))
+                paths = _file_paths_from_raw(
+                    _clean_field(relation.get("file_path"), "relationship.file_path")
+                )
                 relation_metadata: dict[str, Any] = {
-                    "src_id": _string_or_none(relation.get("src_id")),
-                    "tgt_id": _string_or_none(relation.get("tgt_id")),
-                    "keywords": _string_or_none(relation.get("keywords")),
-                    "weight": weight
-                    if isinstance(weight, (int, float)) and not isinstance(weight, bool)
-                    else None,
+                    "src_id": _string_or_none(
+                        _clean_field(relation.get("src_id"), "relationship.src_id")
+                    ),
+                    "tgt_id": _string_or_none(
+                        _clean_field(relation.get("tgt_id"), "relationship.tgt_id")
+                    ),
+                    "keywords": _string_or_none(
+                        _clean_field(relation.get("keywords"), "relationship.keywords")
+                    ),
+                    "weight": weight,
                 }
                 if len(paths) > 1:
                     relation_metadata["source_file_paths"] = paths
                 evidence.append(
                     RetrievedEvidence(
                         document_id=paths[0] if paths else None,
-                        chunk_id=_string_or_none(relation.get("source_id")),
+                        chunk_id=_string_or_none(
+                            _clean_field(relation.get("source_id"), "relationship.source_id")
+                        ),
                         text=description,
                         rank=rank,
                         evidence_type=EvidenceType.RELATIONSHIP,
@@ -797,7 +934,6 @@ class LightRAGAdapter(BaseRAGAdapter):
                     )
                 )
                 rank += 1
-        return evidence
 
     # ------------------------------------------------------------------
     # Health / cleanup
@@ -809,24 +945,45 @@ class LightRAGAdapter(BaseRAGAdapter):
                 healthy=False,
                 system=self.system_name,
                 message="Adapter is not prepared.",
+                details={
+                    "prepared": False,
+                    "dependency_available": _lightrag_dependency_available(),
+                },
+            )
+        dependency_available = _lightrag_dependency_available()
+        initialized = self._rag is not None
+        indexed = self._indexed_documents > 0
+        details = {
+            "prepared": True,
+            "dependency_available": dependency_available,
+            "initialized": initialized,
+            "indexed": indexed,
+            "indexed_documents": self._indexed_documents,
+            "indexed_chunks": self._indexed_chunks,
+            "embedding_dimension": self._embedding_dimension,
+            "working_dir": str(self._working_dir) if self._working_dir is not None else None,
+            "lightrag_version": _lightrag_version(),
+            "query_mode": self._lightrag_config.query_mode,
+            "embedding_provider": type(self._embedding_provider).__name__,
+            "llm_func": (
+                "injected" if self._constructor_llm_func is not None else "openai_compatible"
+            ),
+        }
+        if not dependency_available:
+            return HealthCheckResult(
+                healthy=False,
+                system=self.system_name,
+                message=(
+                    "LightRAG optional dependency is unavailable: the 'lightrag' "
+                    "package is missing or fails to import."
+                ),
+                details=details,
             )
         return HealthCheckResult(
             healthy=True,
             system=self.system_name,
             message="OK",
-            details={
-                "prepared": True,
-                "index_built": self._rag is not None,
-                "indexed_documents": self._indexed_documents,
-                "indexed_chunks": self._indexed_chunks,
-                "embedding_dimension": self._embedding_dimension,
-                "working_dir": str(self._working_dir) if self._working_dir is not None else None,
-                "lightrag_version": _lightrag_version(),
-                "embedding_provider": type(self._embedding_provider).__name__,
-                "llm_func": (
-                    "injected" if self._constructor_llm_func is not None else "openai_compatible"
-                ),
-            },
+            details=details,
         )
 
     def cleanup(self) -> None:
@@ -842,6 +999,31 @@ class LightRAGAdapter(BaseRAGAdapter):
 
 def _string_or_none(value: Any) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def _clean_field(value: Any, label: str) -> Any:
+    """Guard one raw evidence field: explicitly reject non-finite floats.
+
+    NaN/+Infinity/-Infinity never reach strict JSON metadata and are never
+    converted to strings; they raise so the caller reports a canonical
+    failure. Other non-string values are sanitized by the caller.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        raise ValueError(f"non-finite float {value!r} in raw evidence field '{label}'")
+    return value
+
+
+def _finite_evidence_number(value: Any) -> int | float | None:
+    """Extract a finite numeric field from raw evidence.
+
+    Non-finite floats (NaN/+Infinity/-Infinity) are explicitly rejected;
+    booleans and other non-numeric values sanitize to None.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    if not math.isfinite(value):
+        raise ValueError(f"non-finite numeric value {value!r} in raw evidence field 'weight'")
+    return value
 
 
 # LightRAG's GRAPH_FIELD_SEP: merged cross-document file paths are joined
