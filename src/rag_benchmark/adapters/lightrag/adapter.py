@@ -99,11 +99,13 @@ def _import_lightrag_modules() -> SimpleNamespace:
     """Import the LightRAG symbols used by the adapter.
 
     Exception semantics:
-      - the top-level ``lightrag`` package is missing (
-        ``ModuleNotFoundError`` with ``name`` ``lightrag``) -> a clear
-        optional-dependency :class:`ConfigurationError`;
-      - LightRAG is installed but broken (an internal module or dependency
-        fails to import) -> the real import failure is re-raised untouched.
+      - positive evidence that the top-level ``lightrag`` package is missing
+        (``ModuleNotFoundError`` with ``name`` exactly ``"lightrag"``) -> a
+        clear optional-dependency :class:`ConfigurationError`;
+      - anything else (a missing submodule or dependency, or an
+        import-runtime failure with an unpopulated ``name``) -> the real
+        import failure is re-raised untouched. ``name is None`` is never
+        interpreted as the top-level package being absent.
     """
     try:
         from lightrag import LightRAG, QueryParam  # type: ignore[import-untyped]
@@ -112,7 +114,7 @@ def _import_lightrag_modules() -> SimpleNamespace:
             always_get_an_event_loop,
         )
     except ModuleNotFoundError as e:
-        if e.name is None or e.name == "lightrag":
+        if e.name == "lightrag":
             raise ConfigurationError(
                 "The optional 'lightrag' dependency is not installed. "
                 "Install it with `uv sync --extra lightrag`."
@@ -800,11 +802,11 @@ class LightRAGAdapter(BaseRAGAdapter):
         """Map LightRAG's raw query data to canonical RetrievedEvidence.
 
         Appends normalized items to ``evidence`` in retrieval order and
-        returns ``None`` on success. If the raw payload is malformed
-        (bad container types, non-finite numeric fields) a human-readable
-        error message is returned instead; items already normalized before
-        the failure remain in ``evidence`` so the caller can report a
-        canonical failure with the partial provenance.
+        returns ``None`` on success. If the raw payload is malformed (bad
+        container types, present fields of the wrong type, non-finite
+        numerics) a human-readable error message is returned instead; items
+        already normalized before the failure remain in ``evidence`` so the
+        caller can report a canonical failure with the partial provenance.
         """
         try:
             LightRAGAdapter._normalize_evidence(data, evidence)
@@ -837,21 +839,23 @@ class LightRAGAdapter(BaseRAGAdapter):
             for chunk in chunks:
                 if not isinstance(chunk, dict):
                     raise ValueError(f"raw chunk item must be a dict, got {type(chunk).__name__}")
-                content = _clean_field(chunk.get("content"), "chunk.content")
-                if not isinstance(content, str) or not content.strip():
-                    continue
+                # Every consumed field is validated before the emit/skip
+                # decision: a present, wrong-typed field is malformed
+                # upstream raw_data even if the item would be skipped.
+                content = _evidence_text(chunk.get("content"), "chunk.content")
                 paths = _file_paths_from_raw(
-                    _clean_field(chunk.get("file_path"), "chunk.file_path")
+                    _string_or_none(chunk.get("file_path"), "chunk.file_path")
                 )
+                chunk_id = _string_or_none(chunk.get("chunk_id"), "chunk.chunk_id")
+                if content is None or not content.strip():
+                    continue
                 chunk_metadata: dict[str, Any] = {}
                 if len(paths) > 1:
                     chunk_metadata["source_file_paths"] = paths
                 evidence.append(
                     RetrievedEvidence(
                         document_id=paths[0] if paths else None,
-                        chunk_id=_string_or_none(
-                            _clean_field(chunk.get("chunk_id"), "chunk.chunk_id")
-                        ),
+                        chunk_id=chunk_id,
                         text=content,
                         rank=rank,
                         evidence_type=EvidenceType.CHUNK,
@@ -864,28 +868,25 @@ class LightRAGAdapter(BaseRAGAdapter):
             for entity in entities:
                 if not isinstance(entity, dict):
                     raise ValueError(f"raw entity item must be a dict, got {type(entity).__name__}")
-                description = _clean_field(entity.get("description"), "entity.description")
-                if not isinstance(description, str) or not description.strip():
-                    continue
+                description = _evidence_text(entity.get("description"), "entity.description")
                 paths = _file_paths_from_raw(
-                    _clean_field(entity.get("file_path"), "entity.file_path")
+                    _string_or_none(entity.get("file_path"), "entity.file_path")
                 )
+                entity_name = _string_or_none(entity.get("entity_name"), "entity.entity_name")
+                entity_type = _string_or_none(entity.get("entity_type"), "entity.entity_type")
+                source_id = _string_or_none(entity.get("source_id"), "entity.source_id")
+                if description is None or not description.strip():
+                    continue
                 entity_metadata: dict[str, Any] = {
-                    "entity_name": _string_or_none(
-                        _clean_field(entity.get("entity_name"), "entity.entity_name")
-                    ),
-                    "entity_type": _string_or_none(
-                        _clean_field(entity.get("entity_type"), "entity.entity_type")
-                    ),
+                    "entity_name": entity_name,
+                    "entity_type": entity_type,
                 }
                 if len(paths) > 1:
                     entity_metadata["source_file_paths"] = paths
                 evidence.append(
                     RetrievedEvidence(
                         document_id=paths[0] if paths else None,
-                        chunk_id=_string_or_none(
-                            _clean_field(entity.get("source_id"), "entity.source_id")
-                        ),
+                        chunk_id=source_id,
                         text=description,
                         rank=rank,
                         evidence_type=EvidenceType.ENTITY,
@@ -900,23 +901,23 @@ class LightRAGAdapter(BaseRAGAdapter):
                     raise ValueError(
                         f"raw relationship item must be a dict, got {type(relation).__name__}"
                     )
-                description = _clean_field(relation.get("description"), "relationship.description")
-                if not isinstance(description, str) or not description.strip():
-                    continue
-                weight = _finite_evidence_number(relation.get("weight"))
-                paths = _file_paths_from_raw(
-                    _clean_field(relation.get("file_path"), "relationship.file_path")
+                description = _evidence_text(
+                    relation.get("description"), "relationship.description"
                 )
+                weight = _finite_evidence_number(relation.get("weight"), "relationship.weight")
+                paths = _file_paths_from_raw(
+                    _string_or_none(relation.get("file_path"), "relationship.file_path")
+                )
+                src_id = _string_or_none(relation.get("src_id"), "relationship.src_id")
+                tgt_id = _string_or_none(relation.get("tgt_id"), "relationship.tgt_id")
+                keywords = _string_or_none(relation.get("keywords"), "relationship.keywords")
+                source_id = _string_or_none(relation.get("source_id"), "relationship.source_id")
+                if description is None or not description.strip():
+                    continue
                 relation_metadata: dict[str, Any] = {
-                    "src_id": _string_or_none(
-                        _clean_field(relation.get("src_id"), "relationship.src_id")
-                    ),
-                    "tgt_id": _string_or_none(
-                        _clean_field(relation.get("tgt_id"), "relationship.tgt_id")
-                    ),
-                    "keywords": _string_or_none(
-                        _clean_field(relation.get("keywords"), "relationship.keywords")
-                    ),
+                    "src_id": src_id,
+                    "tgt_id": tgt_id,
+                    "keywords": keywords,
                     "weight": weight,
                 }
                 if len(paths) > 1:
@@ -924,9 +925,7 @@ class LightRAGAdapter(BaseRAGAdapter):
                 evidence.append(
                     RetrievedEvidence(
                         document_id=paths[0] if paths else None,
-                        chunk_id=_string_or_none(
-                            _clean_field(relation.get("source_id"), "relationship.source_id")
-                        ),
+                        chunk_id=source_id,
                         text=description,
                         rank=rank,
                         evidence_type=EvidenceType.RELATIONSHIP,
@@ -997,32 +996,48 @@ class LightRAGAdapter(BaseRAGAdapter):
             self._working_dir = None
 
 
-def _string_or_none(value: Any) -> str | None:
-    return value if isinstance(value, str) and value else None
+def _string_or_none(value: Any, label: str) -> str | None:
+    """Strict string field: missing or explicit None -> None; empty str -> None.
 
-
-def _clean_field(value: Any, label: str) -> Any:
-    """Guard one raw evidence field: explicitly reject non-finite floats.
-
-    NaN/+Infinity/-Infinity never reach strict JSON metadata and are never
-    converted to strings; they raise so the caller reports a canonical
-    failure. Other non-string values are sanitized by the caller.
+    A present, non-null value must be a string; any other type (dict, list,
+    bool, number, arbitrary object) is malformed upstream raw_data and
+    raises. Values are never stringified or silently degraded to None.
     """
-    if isinstance(value, float) and not math.isfinite(value):
-        raise ValueError(f"non-finite float {value!r} in raw evidence field '{label}'")
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(
+            f"raw evidence field '{label}' must be a string, got {type(value).__name__}"
+        )
+    return value or None
+
+
+def _evidence_text(value: Any, label: str) -> str | None:
+    """Strict text field: missing or explicit None -> None; else must be a string."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(
+            f"raw evidence field '{label}' must be a string, got {type(value).__name__}"
+        )
     return value
 
 
-def _finite_evidence_number(value: Any) -> int | float | None:
-    """Extract a finite numeric field from raw evidence.
+def _finite_evidence_number(value: Any, label: str) -> int | float | None:
+    """Strict numeric field: missing or explicit None -> None.
 
-    Non-finite floats (NaN/+Infinity/-Infinity) are explicitly rejected;
-    booleans and other non-numeric values sanitize to None.
+    A present, non-null value must be a finite int or float (bool rejected);
+    NaN/+Infinity/-Infinity raise so they can never reach strict JSON
+    metadata.
     """
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
+    if value is None:
         return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(
+            f"raw evidence field '{label}' must be numeric, got {type(value).__name__}"
+        )
     if not math.isfinite(value):
-        raise ValueError(f"non-finite numeric value {value!r} in raw evidence field 'weight'")
+        raise ValueError(f"non-finite numeric value {value!r} in raw evidence field '{label}'")
     return value
 
 
@@ -1031,12 +1046,13 @@ def _finite_evidence_number(value: Any) -> int | float | None:
 _GRAPH_FIELD_SEP = "<SEP>"
 
 
-def _file_paths_from_raw(file_path: Any) -> list[str]:
+def _file_paths_from_raw(file_path: str | None) -> list[str]:
     """The adapter inserts documents with file_paths equal to document IDs.
 
     LightRAG merges cross-document ``file_path`` values with ``<SEP>``; the
-    primary benchmark document id is the first path in the merged list.
+    primary benchmark document id is the first path in the merged list. The
+    caller must have already validated the raw value as ``str | None``.
     """
-    if not isinstance(file_path, str) or not file_path or file_path == "unknown_source":
+    if not file_path or file_path == "unknown_source":
         return []
     return [part for part in (p.strip() for p in file_path.split(_GRAPH_FIELD_SEP)) if part]

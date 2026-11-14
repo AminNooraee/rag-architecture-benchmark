@@ -294,6 +294,277 @@ def test_raw_data_normalization_rejects_non_finite_explicitly() -> None:
     assert evidence[0].metadata["weight"] == 3.5
 
 
+def _assert_canonical_failure(result: QueryResult) -> None:
+    assert result.status is QueryStatus.FAILED
+    assert result.answer is None
+    assert result.error is not None
+    assert result.error.error_type is BenchmarkErrorType.RETRIEVAL_ERROR
+
+
+@pytest.mark.parametrize("bad_value", [{"bad": "object"}, ["unexpected", "list"], True, 42])
+def test_entity_name_wrong_type_returns_canonical_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad_value: Any
+) -> None:
+    adapter, _, _ = make_adapter(
+        tmp_path, extra=LIGHTRAG_EXTRA, embedding=UniformEmbeddingProvider()
+    )
+    _index_two_docs(adapter)
+    payload = _successful_pipeline_payload(
+        {
+            "entities": [
+                {
+                    "entity_name": bad_value,
+                    "entity_type": "Other",
+                    "description": "شرح",
+                    "source_id": "doc-1-chunk-000",
+                    "file_path": "doc-1",
+                }
+            ]
+        }
+    )
+    _assert_canonical_failure(_query_with_fake_pipeline(adapter, monkeypatch, payload))
+
+
+@pytest.mark.parametrize("bad_value", [["unexpected", "list"], {"bad": "object"}])
+def test_chunk_id_wrong_type_returns_canonical_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad_value: Any
+) -> None:
+    adapter, _, _ = make_adapter(
+        tmp_path, extra=LIGHTRAG_EXTRA, embedding=UniformEmbeddingProvider()
+    )
+    _index_two_docs(adapter)
+    payload = _successful_pipeline_payload(
+        {"chunks": [{"file_path": "doc-1", "chunk_id": bad_value, "content": "متن"}]}
+    )
+    _assert_canonical_failure(_query_with_fake_pipeline(adapter, monkeypatch, payload))
+
+
+def test_chunk_content_mapping_returns_canonical_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter, _, _ = make_adapter(
+        tmp_path, extra=LIGHTRAG_EXTRA, embedding=UniformEmbeddingProvider()
+    )
+    _index_two_docs(adapter)
+    payload = _successful_pipeline_payload(
+        {"chunks": [{"file_path": "doc-1", "chunk_id": "c-1", "content": {"bad": "value"}}]}
+    )
+    _assert_canonical_failure(_query_with_fake_pipeline(adapter, monkeypatch, payload))
+
+
+@pytest.mark.parametrize(
+    ("field", "bad_value"),
+    [("src_id", {"bad": 1}), ("src_id", ["x"]), ("tgt_id", True), ("tgt_id", 42)],
+)
+def test_relationship_endpoint_wrong_type_returns_canonical_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, field: str, bad_value: Any
+) -> None:
+    adapter, _, _ = make_adapter(
+        tmp_path, extra=LIGHTRAG_EXTRA, embedding=UniformEmbeddingProvider()
+    )
+    _index_two_docs(adapter)
+    record: dict[str, Any] = {
+        "src_id": "a",
+        "tgt_id": "b",
+        "keywords": "k",
+        "weight": 1.5,
+        "description": "شرح رابطه",
+        "file_path": "doc-1",
+    }
+    record[field] = bad_value
+    payload = _successful_pipeline_payload({"relationships": [record]})
+    _assert_canonical_failure(_query_with_fake_pipeline(adapter, monkeypatch, payload))
+
+
+@pytest.mark.parametrize("bad_value", [True, "1.5"])
+def test_relationship_weight_wrong_type_returns_canonical_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, bad_value: Any
+) -> None:
+    adapter, _, _ = make_adapter(
+        tmp_path, extra=LIGHTRAG_EXTRA, embedding=UniformEmbeddingProvider()
+    )
+    _index_two_docs(adapter)
+    payload = _successful_pipeline_payload(
+        {
+            "relationships": [
+                {
+                    "src_id": "a",
+                    "tgt_id": "b",
+                    "keywords": "k",
+                    "weight": bad_value,
+                    "description": "شرح رابطه",
+                    "file_path": "doc-1",
+                }
+            ]
+        }
+    )
+    _assert_canonical_failure(_query_with_fake_pipeline(adapter, monkeypatch, payload))
+
+
+def test_entity_file_path_mapping_returns_canonical_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter, _, _ = make_adapter(
+        tmp_path, extra=LIGHTRAG_EXTRA, embedding=UniformEmbeddingProvider()
+    )
+    _index_two_docs(adapter)
+    payload = _successful_pipeline_payload(
+        {
+            "entities": [
+                {
+                    "entity_name": "تهران",
+                    "entity_type": "Other",
+                    "description": "شرح",
+                    "file_path": {"bad": "value"},
+                }
+            ]
+        }
+    )
+    _assert_canonical_failure(_query_with_fake_pipeline(adapter, monkeypatch, payload))
+
+
+def test_missing_optional_fields_still_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter, _, _ = make_adapter(
+        tmp_path, extra=LIGHTRAG_EXTRA, embedding=UniformEmbeddingProvider()
+    )
+    _index_two_docs(adapter)
+    payload = _successful_pipeline_payload(
+        {
+            "chunks": [{"content": "متن بدون شناسه"}],
+            "entities": [{"entity_name": "تهران", "description": "شرح بدون جزئیات"}],
+            "relationships": [{"src_id": "a", "tgt_id": "b", "description": "شرح رابطه"}],
+        }
+    )
+    result = _query_with_fake_pipeline(adapter, monkeypatch, payload)
+    assert result.status is QueryStatus.SUCCESS
+    assert len(result.retrieved_evidence) == 3
+    by_type = {e.evidence_type: e for e in result.retrieved_evidence}
+    chunk = by_type[EvidenceType.CHUNK]
+    entity = by_type[EvidenceType.ENTITY]
+    relationship = by_type[EvidenceType.RELATIONSHIP]
+    assert chunk.document_id is None and chunk.chunk_id is None
+    assert entity.document_id is None and entity.chunk_id is None
+    assert entity.metadata["entity_type"] is None
+    assert relationship.metadata["weight"] is None
+    assert relationship.metadata["keywords"] is None
+
+
+def test_explicit_none_optional_fields_still_accepted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter, _, _ = make_adapter(
+        tmp_path, extra=LIGHTRAG_EXTRA, embedding=UniformEmbeddingProvider()
+    )
+    _index_two_docs(adapter)
+    payload = _successful_pipeline_payload(
+        {
+            "entities": [
+                {
+                    "entity_name": "تهران",
+                    "entity_type": None,
+                    "description": "شرح",
+                    "source_id": None,
+                    "file_path": None,
+                }
+            ]
+        }
+    )
+    result = _query_with_fake_pipeline(adapter, monkeypatch, payload)
+    assert result.status is QueryStatus.SUCCESS
+    entity = result.retrieved_evidence[0]
+    assert entity.evidence_type is EvidenceType.ENTITY
+    assert entity.document_id is None and entity.chunk_id is None
+    assert entity.metadata["entity_type"] is None
+
+
+def test_valid_full_evidence_still_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter, _, _ = make_adapter(
+        tmp_path, extra=LIGHTRAG_EXTRA, embedding=UniformEmbeddingProvider()
+    )
+    _index_two_docs(adapter)
+    payload = _successful_pipeline_payload(
+        {
+            "chunks": [{"file_path": "doc-1", "chunk_id": "doc-1-chunk-000", "content": "متن تکه"}],
+            "entities": [
+                {
+                    "entity_name": "تهران",
+                    "entity_type": "City",
+                    "description": "شرح شهر",
+                    "source_id": "doc-1-chunk-000",
+                    "file_path": "doc-1",
+                }
+            ],
+            "relationships": [
+                {
+                    "src_id": "a",
+                    "tgt_id": "b",
+                    "keywords": "k",
+                    "weight": 2.5,
+                    "description": "شرح رابطه",
+                    "source_id": "doc-1-chunk-000",
+                    "file_path": "doc-2",
+                }
+            ],
+        }
+    )
+    result = _query_with_fake_pipeline(adapter, monkeypatch, payload)
+    assert result.status is QueryStatus.SUCCESS
+    assert result.answer == ANSWER
+    assert [e.rank for e in result.retrieved_evidence] == [1, 2, 3]
+    chunk, entity, relationship = result.retrieved_evidence
+    assert (chunk.evidence_type, chunk.document_id, chunk.chunk_id) == (
+        EvidenceType.CHUNK,
+        "doc-1",
+        "doc-1-chunk-000",
+    )
+    assert (entity.evidence_type, entity.document_id, entity.chunk_id) == (
+        EvidenceType.ENTITY,
+        "doc-1",
+        "doc-1-chunk-000",
+    )
+    assert (entity.metadata["entity_name"], entity.metadata["entity_type"]) == ("تهران", "City")
+    assert (
+        relationship.evidence_type,
+        relationship.document_id,
+        relationship.metadata["weight"],
+    ) == (EvidenceType.RELATIONSHIP, "doc-2", 2.5)
+
+
+def test_malformed_entity_after_valid_entity_preserves_prior_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    adapter, _, _ = make_adapter(
+        tmp_path, extra=LIGHTRAG_EXTRA, embedding=UniformEmbeddingProvider()
+    )
+    _index_two_docs(adapter)
+    payload = _successful_pipeline_payload(
+        {
+            "entities": [
+                {
+                    "entity_name": "سالم",
+                    "entity_type": "Other",
+                    "description": "شرح سالم",
+                    "file_path": "doc-1",
+                },
+                {
+                    "entity_name": ["bad"],
+                    "entity_type": "Other",
+                    "description": "شرح خراب",
+                    "file_path": "doc-1",
+                },
+            ]
+        }
+    )
+    result = _query_with_fake_pipeline(adapter, monkeypatch, payload)
+    _assert_canonical_failure(result)
+    assert len(result.retrieved_evidence) == 1
+    assert result.retrieved_evidence[0].metadata["entity_name"] == "سالم"
+
+
 # ---------------------------------------------------------------------------
 # Finding 3: internal LightRAG ImportError must not be "package missing"
 # ---------------------------------------------------------------------------
@@ -351,6 +622,30 @@ def test_internal_import_error_is_not_mislabelled(
         adapter_module._require_lightrag()
     assert exc_info.value is internal_error
     assert not isinstance(exc_info.value, ConfigurationError)
+
+
+def test_module_not_found_with_none_name_is_preserved(
+    monkeypatch: pytest.MonkeyPatch, fresh_lightrag_cache: None
+) -> None:
+    internal_error = ModuleNotFoundError("internal failure")
+    assert internal_error.name is None
+    _patch_lightrag_import(monkeypatch, internal_error)
+    with pytest.raises(ModuleNotFoundError) as exc_info:
+        adapter_module._require_lightrag()
+    assert exc_info.value is internal_error
+    assert not isinstance(exc_info.value, ConfigurationError)
+    assert "not installed" not in str(exc_info.value)
+
+
+def test_installed_lightrag_imports_normally(
+    monkeypatch: pytest.MonkeyPatch, fresh_lightrag_cache: None
+) -> None:
+    modules = adapter_module._require_lightrag()
+    assert modules.LightRAG is not None
+    assert modules.QueryParam is not None
+    assert modules.EmbeddingFunc is not None
+    assert modules.always_get_an_event_loop is not None
+    assert adapter_module._lightrag_modules is modules
 
 
 # ---------------------------------------------------------------------------
